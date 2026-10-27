@@ -1821,6 +1821,9 @@ class QtImageViewerPlus(QtImageViewer):
 
         self.updateVisibility()
 
+        # TagLab restores what else the operation changed (e.g. the comparison tables)
+        return operation
+
     def redo(self):
         operation = self.undo_data.redo()
         if operation is None:
@@ -1847,6 +1850,8 @@ class QtImageViewerPlus(QtImageViewer):
             blob.qpath_gitem.setBrush(brush)
 
         self.updateVisibility()
+
+        return operation
 
 
     def resizeEvent(self, event):

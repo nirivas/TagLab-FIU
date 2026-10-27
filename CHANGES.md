@@ -72,6 +72,38 @@ under the same GPL-3 licence. It changes the following.
 - **Markers:** they are saved with the project.
 - **DEMs:** they keep their no-data areas, and georeferencing is preserved.
 
+## Carry Regions Over (Compare > Carry Regions Over…)
+Annotates a new timepoint from the previous one. The two maps must already be aligned, for example with the
+Alignment Tool.
+- **What it does:** each colony of the annotated map is placed at the same position on the new map. Its outline is
+  fitted to the new image with RITM, and TagLab checks whether the colony is still there by comparing structure,
+  colour, brightness, texture and, when both maps have a DEM, height.
+- **Choices in the window:** the two maps, the classes to copy, outline fitting on or off, and the elevation change
+  (only when both maps have a DEM).
+- **How the maps are lined up:** same pixel grid, through the georeferencing, or a small offset found from the
+  images. A small local shift (up to 5 cm) is also corrected around each colony.
+- **Result on the new map:**
+  - Each colony keeps its class, name and custom attributes. DEM metrics are not copied.
+  - Three new region attributes, exported in the CSV and shapefile:
+    - `carryover`: `ok`, `check`, `possibly gone`, or `kept` after review
+    - `carry_conf`: 0 to 1, how sure TagLab is that the colony is still there
+    - `carry_from`: the id of the colony on the old map
+  - Colonies already outlined on the new map are matched, not copied twice.
+  - Each colony is matched to its old one in the comparison table. Doubtful ones are highlighted in dark red.
+  - One Undo removes everything that was added.
+- **Nothing is deleted automatically.** The doubtful colonies (`check` and `possibly gone`) are listed in a review
+  window, most likely gone first. TagLab shows each one in both maps.
+  - **N / P:** next or previous colony.
+  - **K:** keep it.
+  - **Delete:** remove it; it becomes "dead" in the comparison table.
+  - You can also redraw it or change its class. Compare > Review Carried-over Colonies reopens the list.
+- **Tests on the official 2013–2014 sample:**
+  - About three quarters of the surviving colonies came out `ok`.
+  - 85–94% of colonies removed on purpose from the image were flagged, as were nearly all the bleached or overgrown
+    ones.
+  - Colonies flattened in the DEM came out `possibly gone`.
+- **Speed:** about 0.4 s per colony on a laptop CPU, much less on an NVIDIA GPU.
+
 ## Rotate Map (Project > Rotate Map…)
 - Creates a rotated copy of a map: 90°, 180° and 270° are exact, or you can enter any angle.
 - The DEM, the colonies, the points and the georeferencing are rotated too.

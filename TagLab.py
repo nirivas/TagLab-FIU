@@ -63,6 +63,9 @@ import csv
 import source.Mask as Mask
 import source.RasterOps as rasterops
 from source import DemMetrics
+from source import CarryOver
+from source.QtCarryOverWidget import QtCarryOverWidget
+from source.QtCarryOverReview import QtCarryOverReview
 from source.QtImageViewerPlus import QtImageViewerPlus
 from source.QtMapViewer import QtMapViewer
 from source.QtSettingsWidget import QtSettingsWidget
@@ -159,6 +162,33 @@ class ClassifierWorker(QObject):
             self.finished.emit()
 
 
+class BackgroundWorker(QObject):
+    """
+    Runs function(progress, stop) in a worker thread (see TagLab.runInBackground). The function reports the
+    percentage done with progress(value) and stops when stop() returns True. The result, or the error, is kept for
+    the main thread.
+    """
+
+    finished = pyqtSignal()
+    progressChanged = pyqtSignal(float)
+
+    def __init__(self, function):
+        super(BackgroundWorker, self).__init__()
+        self.function = function
+        self.result = None
+        self.error = None
+        self.stop_requested = False
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            self.result = self.function(self.progressChanged.emit, lambda: self.stop_requested)
+        except BaseException as e:
+            self.error = e
+        finally:
+            self.finished.emit()
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
@@ -247,6 +277,12 @@ class TagLab(QMainWindow):
         self.classifierWidget = None
         self.newDatasetWidget = None
         self.help_widget = None
+
+        # carry-over (Compare > Carry Regions Over)
+        self.background_worker = None
+        self.background_progress = None
+        self.carryover_review = None
+        self.carryover_reasons = {}   # image id -> {region id: reasons}, for the review panel (not saved)
 
         self.trainYourNetworkWidget = None
         self.datasetManagerWidget = None
@@ -1410,6 +1446,16 @@ class TagLab(QMainWindow):
         exportGenetCSV.setStatusTip("Export genets history of corals in CSV")
         exportGenetCSV.triggered.connect(self.exportGenetCSV)
 
+        carryOverAct = QAction("Carry Regions Over...", self)
+        carryOverAct.setStatusTip("Copy the regions of an annotated map onto the new map of the same plot, fit them "
+                                  "to the new image and flag the colonies that may be gone")
+        carryOverAct.triggered.connect(self.openCarryOverDialog)
+
+        carryOverReviewAct = QAction("Review Carried-over Colonies", self)
+        carryOverReviewAct.setStatusTip("List the carried-over colonies marked 'check' or 'possibly gone' and show "
+                                        "them one by one")
+        carryOverReviewAct.triggered.connect(self.openCarryOverReview)
+
 
         ##### TRAIN MENU
 
@@ -1431,6 +1477,9 @@ class TagLab(QMainWindow):
         self.comparemenu.addSeparator()
         self.comparemenu.addAction(exportGenetSVG)
         self.comparemenu.addAction(exportGenetCSV)
+        self.comparemenu.addSeparator()
+        self.comparemenu.addAction(carryOverAct)
+        self.comparemenu.addAction(carryOverReviewAct)
         self.comparemenu.addSeparator()
         self.comparemenu.addAction(clearComparisonTable)
 
@@ -1903,6 +1952,14 @@ class TagLab(QMainWindow):
             msg = "[KEYPRESS] Key '" + key_pressed + "' has been pressed."
 
         logfile.info(msg)
+
+        # while the review panel of the carried-over colonies is open: N next, P previous, K keep (Delete: see
+        # deleteSelectedBlobs)
+        if self.carryover_review is not None and self.carryover_review.isVisible() and \
+                not int(modifiers) & int(Qt.ControlModifier | Qt.AltModifier):
+            if event.key() in (Qt.Key_N, Qt.Key_P, Qt.Key_K):
+                self.carryover_review.handleKey(event.key())
+                return
 
         if event.key() == Qt.Key_Escape:
             for viewer in (self.viewerplus, self.viewerplus2):
@@ -2498,12 +2555,66 @@ class TagLab(QMainWindow):
     @pyqtSlot()
     def undo(self):
         if self.activeviewer:
-            self.activeviewer.undo()
+            operation = self.activeviewer.undo()
+            self.restoreCorrespondences(operation, undo=True)
 
     @pyqtSlot()
     def redo(self):
         if self.activeviewer:
-            self.activeviewer.redo()
+            operation = self.activeviewer.redo()
+            self.restoreCorrespondences(operation, undo=False)
+
+    def snapshotCorrespondences(self, image):
+        """
+        Copy of the comparison tables of the given map: {key: (table, data)}. See attachCorrespondencesUndo.
+        """
+        tables = self.project.correspondences or {}
+        return {key: (table, table.data.copy()) for key, table in tables.items()
+                if table.source is image or table.target is image}
+
+    def attachCorrespondencesUndo(self, operation, before, image):
+        """
+        Store in an undo operation the comparison tables of the map before and after the operation, so that undo and
+        redo restore them (the other operations do not).
+        """
+        tables = self.project.correspondences or {}
+        after = {key: table for key, table in tables.items() if table.source is image or table.target is image}
+        states = {}
+        for key in set(before) | set(after):
+            table = after[key] if key in after else before[key][0]
+            data_before = before[key][1] if key in before else None
+            data_after = after[key].data.copy() if key in after else None
+            states[key] = (table, data_before, data_after)
+        operation['tables'] = states
+
+    def restoreCorrespondences(self, operation, undo):
+
+        if operation is None:
+            return
+
+        if 'tables' in operation:
+            if self.project.correspondences is None:
+                self.project.correspondences = {}
+            for key, (table, data_before, data_after) in operation['tables'].items():
+                data = data_before if undo else data_after
+                if data is None:
+                    # the table did not exist before the operation
+                    if self.project.correspondences.get(key) is table:
+                        del self.project.correspondences[key]
+                else:
+                    table.data = data.copy()
+                    self.project.correspondences[key] = table
+            self.project.updateGenets()
+            if self.split_screen_flag and self.compare_panel.isVisible():
+                self.compare_panel.setTable(self.project, self.comboboxSourceImage.currentIndex(),
+                                            self.comboboxTargetImage.currentIndex())
+
+        if self.carryover_review is not None:
+            if undo and operation.get('carryover', False):
+                # the carried-over regions are gone
+                self.closeCarryOverReview()
+            else:
+                self.carryover_review.refresh()
 
     @pyqtSlot()
     def setActiveViewer(self):
@@ -2737,6 +2848,9 @@ class TagLab(QMainWindow):
         if self.gridWidget is not None:
             self.gridWidget.close()
             self.gridWidget = None
+
+        self.closeCarryOverReview()
+        self.carryover_reasons = {}
 
         self.viewerplus.clear()
         self.viewerplus2.clear()
@@ -3072,6 +3186,16 @@ class TagLab(QMainWindow):
         self.blob_with_info_displayed = None
 
     def deleteSelectedBlobs(self):
+        # the colony under review in the carry-over review panel: removed through the panel (it moves to the next one
+        # and Undo also restores the comparison table)
+        review = self.carryover_review
+        if review is not None and review.isVisible() and self.activeviewer is self.viewerplus2:
+            blob = review.currentBlob()
+            if blob is not None and self.viewerplus2.image is review.target_image and \
+                    self.viewerplus2.selected_blobs == [blob]:
+                review.removeCurrent()
+                return
+
         if self.viewerplus.tools.tool == 'MATCH':
             self.deleteMatch()
         #disable delete blobs while creating new ones
@@ -5896,6 +6020,440 @@ class TagLab(QMainWindow):
         box.setWindowTitle(self.TAGLAB_VERSION)
         box.setText(txt)
         box.exec()
+
+    #### CARRY-OVER OF THE REGIONS TO A NEW TIMEPOINT (source/CarryOver.py)
+
+    def showImagePair(self, source_index, target_index):
+        """
+        Show the two maps in split screen (source on the left). Returns False if split screen cannot be enabled.
+        """
+        if self.split_screen_flag is False:
+            self.enableSplitScreen()
+            if self.split_screen_flag is False:
+                return False
+
+        if self.comboboxSourceImage.currentIndex() == source_index and \
+                self.comboboxTargetImage.currentIndex() == target_index:
+            return True
+
+        # the two comboboxes never show the same map: change first the one that does not clash
+        if self.comboboxSourceImage.currentIndex() == target_index:
+            self.comboboxSourceImage.setCurrentIndex(source_index)
+            self.comboboxTargetImage.setCurrentIndex(target_index)
+        else:
+            self.comboboxTargetImage.setCurrentIndex(target_index)
+            self.comboboxSourceImage.setCurrentIndex(source_index)
+        return True
+
+    def channelQImage(self, image):
+        channel = image.getRGBChannel()
+        if channel.qimage is None:
+            channel.loadData(self.taglab_dir)
+        return channel.qimage
+
+    def runInBackground(self, title, function):
+        """
+        Run function(progress, stop) in a worker thread, with a progress window and a Cancel button (see
+        BackgroundWorker). The window stays responsive while this method waits. It returns (result, stopped); an
+        error of the function is raised here.
+        """
+        progress = QProgressDialog(title, "Cancel", 0, 100, self)
+        progress.setWindowTitle(self.TAGLAB_VERSION)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumWidth(400)
+        # Cancel button and Esc key
+        progress.canceled.connect(self.stopBackgroundWork)
+        progress.rejected.connect(self.stopBackgroundWork)
+        progress.setValue(0)
+
+        worker = BackgroundWorker(function)
+        self.background_worker = worker
+        self.background_progress = progress
+        worker.progressChanged.connect(self.setBackgroundProgress)
+
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+
+        loop = QEventLoop()
+        thread.finished.connect(loop.quit)
+        progress.show()
+        thread.start()
+        loop.exec_()
+        thread.wait()
+
+        worker.progressChanged.disconnect(self.setBackgroundProgress)
+        # closing a QProgressDialog emits canceled: with background_progress None it does not stop anything
+        self.background_progress = None
+        self.background_worker = None
+        progress.close()
+
+        if worker.error is not None:
+            raise worker.error
+
+        return worker.result, worker.stop_requested
+
+    @pyqtSlot()
+    def stopBackgroundWork(self):
+        if self.background_worker is not None and self.background_progress is not None:
+            self.background_worker.stop_requested = True
+            self.background_progress.setLabelText("Stopping..")
+
+    @pyqtSlot(float)
+    def setBackgroundProgress(self, value):
+        if self.background_progress is not None:
+            if self.background_progress.wasCanceled():
+                self.stopBackgroundWork()
+            else:
+                self.background_progress.setValue(int(value))
+
+    @pyqtSlot()
+    def openCarryOverDialog(self):
+
+        if len(self.project.images) < 2:
+            box = QMessageBox()
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("Carry Regions Over needs two maps of the same plot in the project: the annotated one and "
+                        "the new one (aligned to it, for example with the Alignment Tool).")
+            box.exec()
+            return
+
+        if self.split_screen_flag:
+            source_index = self.comboboxSourceImage.currentIndex()
+            target_index = self.comboboxTargetImage.currentIndex()
+        else:
+            source_index, target_index = 0, 1
+
+        dialog = QtCarryOverWidget(self.project, source_index, target_index, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        self.runCarryOver(dialog.sourceIndex(), dialog.targetIndex(), dialog.selectedBlobs(), dialog.refit(),
+                          dialog.useDem())
+
+    def runCarryOver(self, source_index, target_index, blobs, refit=True, use_dem=False):
+        """
+        Carry the given regions of the source map over to the target map (see source/CarryOver.py), then add them to
+        the target map, match them in the comparison table and open the review panel.
+        """
+        if source_index == target_index or len(blobs) == 0:
+            return
+
+        if not self.showImagePair(source_index, target_index):
+            box = QMessageBox()
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("Split screen cannot be enabled now (close the working area tool first).")
+            box.exec()
+            return
+
+        self.closeCarryOverReview()
+        source_image = self.project.images[source_index]
+        target_image = self.project.images[target_index]
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            source_qimage = self.channelQImage(source_image)
+            target_qimage = self.channelQImage(target_image)
+            placement = CarryOver.computePlacement(source_image, target_image, source_qimage, target_qimage)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        logfile.info("[CARRYOVER] {:s} -> {:s}: {:s} ({:s})".format(source_image.id, target_image.id,
+                                                                     placement.method, placement.message))
+        if placement.method != "same grid" or placement.warning is not None:
+            txt = placement.message
+            if placement.warning is not None:
+                txt += "\n\nWARNING: " + placement.warning
+            txt += "\n\nContinue?"
+            reply = QMessageBox.question(self, self.TAGLAB_VERSION, txt, QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+
+        ctx = CarryOver.CarryOverContext(source_image, target_image, source_qimage, target_qimage, placement,
+                                         self.taglab_dir, refit=refit, use_dem=use_dem,
+                                         existing_blobs=target_image.annotations.seg_blobs)
+        start = datetime.datetime.now()
+        try:
+            results, stopped = self.runInBackground(
+                "Carrying {:d} regions over to {:s}..".format(len(blobs), target_image.name),
+                lambda progress, stop: CarryOver.carryOver(blobs, ctx, progress, stop))
+        finally:
+            ctx.close()
+        seconds = (datetime.datetime.now() - start).total_seconds()
+
+        if stopped:
+            logfile.info("[CARRYOVER] Stopped by the user.")
+            box = QMessageBox()
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("Carry-over stopped: nothing has been added to the map.")
+            box.exec()
+            return
+
+        logfile.info("[CARRYOVER] {:d} regions processed in {:.0f} s.".format(len(results), seconds))
+        self.addCarriedColonies(source_image, target_image, results, placement)
+
+    def addCarriedColonies(self, source_image, target_image, results, placement):
+        """
+        Add the carried-over regions to the target map (shown in viewerplus2) as a single undo step, and match them
+        in the comparison table.
+        """
+        viewer = self.viewerplus2
+        carried = [r for r in results if r.blob is not None]
+        matched = [r for r in results if r.existing_id is not None]
+        not_covered = [r for r in results if r.blob is None and r.existing_id is None]
+
+        CarryOver.registerAttributes(self.project)
+
+        before = self.snapshotCorrespondences(target_image)
+        source_index = self.project.images.index(source_image)
+        target_index = self.project.images.index(target_image)
+        table = self.project.getImagePairCorrespondences(source_index, target_index)
+        new_table = table is None
+        if new_table:
+            table = self.project.createCorrespondencesTable(source_index, target_index)
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            # ids assigned in one pass (Annotation.addBlob would look for a free id for each region)
+            next_id = max([b.id for b in target_image.annotations.seg_blobs], default=-1) + 1
+            reasons = self.carryover_reasons.setdefault(target_image.id, {})
+            new_blobs = []
+            for r in carried:
+                r.blob.setId(next_id)
+                next_id += 1
+                viewer.addBlob(r.blob, selected=False, redraw=False)
+                reasons[r.blob.id] = r.reasons
+                new_blobs.append(r.blob)
+            viewer.scene.invalidate()
+
+            # the new regions are born in the other tables of the map; in this pair, each one is matched to its
+            # region of the source map
+            if len(new_blobs) > 0:
+                self.project.updateCorrespondences("ADD", target_image, new_blobs, None)
+            source_blobs = {b.id: b for b in source_image.annotations.seg_blobs}
+            target_blobs = {b.id: b for b in target_image.annotations.seg_blobs}
+            for r in carried:
+                table.set([source_blobs[r.source_id]], [r.blob])
+                # the doubtful colonies are highlighted in the comparison table
+                r.blob.correspondence_to_check = r.status != CarryOver.STATUS_OK
+
+            # a region already outlined on the new map is matched only if neither of the two is matched yet
+            for r in matched:
+                src = source_blobs[r.source_id]
+                tgt = target_blobs[r.existing_id]
+                rows1 = table.data[table.data['Blob1'] == src.id]
+                rows2 = table.data[table.data['Blob2'] == tgt.id]
+                if (rows1['Blob2'] < 0).all() and (rows2['Blob1'] < 0).all():
+                    table.set([src], [tgt])
+
+            if new_table:
+                # the other regions are dead or born, as in Compute Automatic Matches
+                in_table1 = set(table.data['Blob1'])
+                in_table2 = set(table.data['Blob2'])
+                for blob in source_image.annotations.seg_blobs:
+                    if blob.id not in in_table1 and blob.class_name != "Empty":
+                        table.set([blob], [])
+                for blob in target_image.annotations.seg_blobs:
+                    if blob.id not in in_table2 and blob.class_name != "Empty":
+                        table.set([], [blob])
+
+            self.project.updateGenets()
+
+            # one undo step, which also restores the comparison tables
+            self.attachCorrespondencesUndo(viewer.undo_data.operation, before, target_image)
+            viewer.undo_data.operation['carryover'] = True
+            viewer.saveUndo()
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # undo applies to the map with the new regions
+        self.activeviewer = viewer
+        self.inactiveviewer = self.viewerplus
+        self.updatePanels()
+        self.groupbox_blobpanel.updateRegionAttributes(self.project.region_attributes)
+        if self.blob_with_info_displayed is not None:
+            self.updatePanelInfo(self.blob_with_info_displayed)
+
+        counts = {}
+        for r in carried:
+            counts[r.status] = counts.get(r.status, 0) + 1
+        logfile.info("[CARRYOVER] {:d} carried {}, {:d} already on the map, {:d} not covered.".format(
+            len(carried), counts, len(matched), len(not_covered)))
+
+        txt = "{:d} regions carried over from {:s} to {:s}:\n".format(len(carried), source_image.name,
+                                                                         target_image.name)
+        txt += "    ok: {:d}\n    check: {:d}\n    possibly gone: {:d}".format(
+            counts.get(CarryOver.STATUS_OK, 0), counts.get(CarryOver.STATUS_CHECK, 0),
+            counts.get(CarryOver.STATUS_GONE, 0))
+        if len(matched) > 0:
+            txt += "\n\n{:d} colonies were already outlined on the new map: they are matched, not copied.".format(
+                len(matched))
+        if len(not_covered) > 0:
+            txt += "\n\n{:d} regions are outside the new map or over its empty area: they are not copied.".format(
+                len(not_covered))
+        txt += "\n\n" + placement.message
+        txt += "\n\nThe status is stored in the region attribute \"carryover\" (score in \"carry_conf\", old id in " \
+               "\"carry_from\"). One Undo removes all the carried regions. Remember to save the project."
+        box = QMessageBox()
+        box.setWindowTitle(self.TAGLAB_VERSION)
+        box.setText(txt)
+        box.exec()
+
+        if counts.get(CarryOver.STATUS_CHECK, 0) + counts.get(CarryOver.STATUS_GONE, 0) > 0:
+            self.showCarryOverReview(source_image, target_image)
+
+    @pyqtSlot()
+    def openCarryOverReview(self):
+
+        if self.split_screen_flag is False:
+            box = QMessageBox()
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("Please, enable Split Screen and select the map the regions were carried over from (left) "
+                        "and the new map (right).")
+            box.exec()
+            return
+
+        source_image = self.viewerplus.image
+        target_image = self.viewerplus2.image
+        flagged = [b for b in target_image.annotations.seg_blobs
+                   if b.data.get(CarryOver.ATTR_STATUS) in QtCarryOverReview.STATUS_ORDER]
+        if len(flagged) == 0:
+            box = QMessageBox()
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("No carried-over colonies to review on " + target_image.name + " (none is marked 'check', "
+                        "'possibly gone' or 'kept').")
+            box.exec()
+            return
+
+        self.showCarryOverReview(source_image, target_image)
+
+    def showCarryOverReview(self, source_image, target_image):
+
+        self.closeCarryOverReview()
+        review = QtCarryOverReview(source_image, target_image, self.carryover_reasons.get(target_image.id, {}),
+                                   parent=self)
+        review.showColony[int, int].connect(self.showCarriedColony)
+        review.keepColony[int].connect(self.keepCarriedColony)
+        review.removeColony[int].connect(self.removeCarriedColony)
+        review.closed.connect(self.carryOverReviewClosed)
+        self.carryover_review = review
+        # N is the shortcut of Regions > Create a Background Region: while reviewing it means "next colony"
+        self.createNegative.setShortcut(QKeySequence())
+        review.show()
+        review.next()
+
+    def closeCarryOverReview(self):
+        if self.carryover_review is not None:
+            review = self.carryover_review
+            self.carryover_review = None
+            review.close()
+        self.createNegative.setShortcut(QKeySequence("N"))
+
+    @pyqtSlot()
+    def carryOverReviewClosed(self):
+        if self.sender() is self.carryover_review:
+            self.carryover_review = None
+            self.createNegative.setShortcut(QKeySequence("N"))
+
+    def carryOverReviewPair(self):
+        """
+        Show the two maps of the review panel; returns False (and closes the panel) if one of them is gone.
+        """
+        review = self.carryover_review
+        if review is None:
+            return False
+        if review.source_image not in self.project.images or review.target_image not in self.project.images:
+            self.closeCarryOverReview()
+            return False
+        return self.showImagePair(self.project.images.index(review.source_image),
+                                  self.project.images.index(review.target_image))
+
+    @pyqtSlot(int, int)
+    def showCarriedColony(self, source_id, target_id):
+        """
+        Select the colony in both maps and zoom on it (the left map follows the right one).
+        """
+        if not self.carryOverReviewPair():
+            return
+
+        blob = self.viewerplus2.annotations.blobById(target_id)
+        if blob is None:
+            return
+
+        self.viewerplus.resetSelection()
+        self.viewerplus2.resetSelection()
+        source_blob = self.viewerplus.annotations.blobById(source_id)
+        if source_blob is not None:
+            self.viewerplus.addToSelectedList(source_blob)
+        self.viewerplus2.addToSelectedList(blob)
+
+        # the colony takes about a third of the view
+        viewer = self.viewerplus2
+        top, left, w, h = [float(v) for v in blob.bbox]
+        side = 3.0 * max(w, h, 20.0)
+        zoom = min(viewer.viewport().width(), viewer.viewport().height()) / side
+        viewer.zoom_factor = max(viewer.ZOOM_FACTOR_MIN, min(viewer.ZOOM_FACTOR_MAX, zoom))
+        viewer.updateViewer()
+        viewer.centerOn(left + w / 2.0, top + h / 2.0)
+        viewer.viewChanged()
+
+        self.activeviewer = viewer
+        self.inactiveviewer = self.viewerplus
+        self.updatePanelInfo(blob)
+
+        corr = self.project.getImagePairCorrespondences(self.comboboxSourceImage.currentIndex(),
+                                                        self.comboboxTargetImage.currentIndex())
+        if corr is not None and self.compare_panel.model is not None:
+            sourcecluster, targetcluster, rows = corr.findCluster(blob.id, is_source=False)
+            self.compare_panel.selectRows(rows)
+
+    @pyqtSlot(int)
+    def keepCarriedColony(self, target_id):
+        review = self.carryover_review
+        if review is None:
+            return
+        blob = review.target_image.annotations.blobById(target_id)
+        if blob is not None:
+            blob.data[CarryOver.ATTR_STATUS] = CarryOver.STATUS_KEPT
+            logfile.info("[CARRYOVER] Region {:d} kept.".format(blob.id))
+            if self.blob_with_info_displayed is blob:
+                self.updatePanelInfo(blob)
+
+    @pyqtSlot(int)
+    def removeCarriedColony(self, target_id):
+        """
+        Delete the colony from the new map (it becomes dead in the comparison table); Undo brings it back.
+        """
+        if not self.carryOverReviewPair():
+            return
+
+        viewer = self.viewerplus2
+        blob = viewer.annotations.blobById(target_id)
+        if blob is None:
+            return
+
+        viewer.tools.edit_points.reset()
+        viewer.resetSelection()
+        viewer.addToSelectedList(blob)
+        before = self.snapshotCorrespondences(viewer.image)
+        viewer.deleteSelectedBlobs()
+        # Undo of the deletion also restores the comparison tables
+        operations = viewer.undo_data.operations
+        if len(operations) > 0:
+            operation = operations[viewer.undo_data.position]
+            if any(b is blob for b in operation['add']):
+                self.attachCorrespondencesUndo(operation, before, viewer.image)
+        logfile.info("[CARRYOVER] Region {:d} removed.".format(target_id))
+
+        self.activeviewer = viewer
+        self.inactiveviewer = self.viewerplus
+        if self.compare_panel.isVisible():
+            self.compare_panel.setTable(self.project, self.comboboxSourceImage.currentIndex(),
+                                        self.comboboxTargetImage.currentIndex())
 
     def load(self, filename):
         """
