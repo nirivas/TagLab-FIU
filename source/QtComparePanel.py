@@ -18,7 +18,8 @@
 # for more details.                                               
 from PyQt5.QtCore import Qt, QAbstractTableModel, QItemSelectionModel, QSortFilterProxyModel, QRegExp, QModelIndex, pyqtSlot, pyqtSignal
 from PyQt5.QtWidgets import QWidget, QSizePolicy, QComboBox, QLabel, QTableView, QHeaderView, \
-    QVBoxLayout, QAbstractItemView, QStyledItemDelegate, QAction, QMenu, QToolButton, QGridLayout, QLineEdit
+    QVBoxLayout, QAbstractItemView, QStyledItemDelegate, QAction, QMenu, QToolButton, QGridLayout, QLineEdit, \
+    QMessageBox
 from PyQt5.QtGui import QColor
 from pathlib import Path
 
@@ -95,10 +96,12 @@ class TableModel(QAbstractTableModel):
         if index.isValid() and role == Qt.EditRole:
 
             self._data.iloc[index.row(), index.column()] = value
+            # "dead" is kept (a colony dead in place); any other choice is computed again from the areas
+            self.correspondences.refresh()
         else:
             return False
 
-        # self.dataChanged.emit(index, index)
+        self.dataChanged.emit(self.index(index.row(), 0), self.index(index.row(), self.columnCount(index) - 1))
 
         return True
 
@@ -132,12 +135,59 @@ class TableModel(QAbstractTableModel):
 
     def flags(self, index):
 
-        value = self._data.iloc[index.row(), index.column()]
-
-        if index.column() == 6 or index.column() == 7:
+        # only the action of a matched pair can be changed by hand (dead in place); born, dead and split/fuse
+        # follow from the matches
+        if index.column() == 6 and self._data.iloc[index.row(), 1] >= 0 and self._data.iloc[index.row(), 2] >= 0:
             return QAbstractTableModel.flags(self, index) | Qt.ItemIsEditable
         else:
             return QAbstractTableModel.flags(self, index)
+
+
+def rowsToCheck(corr):
+    """
+    Positions of the rows of the comparison table with a region marked to check (shown in dark red).
+    """
+    src, tgt = corr.regionsById()
+    rows = []
+    for r, (id1, id2) in enumerate(zip(corr.data['Blob1'], corr.data['Blob2'])):
+        blob1 = src.get(int(id1))
+        blob2 = tgt.get(int(id2))
+        if (blob1 is not None and blob1.correspondence_to_check) or \
+                (blob2 is not None and blob2.correspondence_to_check):
+            rows.append(r)
+    return rows
+
+
+class MatchFilterModel(QSortFilterProxyModel):
+    """
+    Sorting and filtering of the comparison table: all the rows, the rows with a given action, or the rows to check.
+    """
+
+    def __init__(self, parent=None):
+        super(MatchFilterModel, self).__init__(parent)
+        self.mode = "all"
+        self.rows_to_check = None
+
+    def setMode(self, mode):
+        self.mode = mode
+        self.rows_to_check = None
+        self.invalidateFilter()
+
+    def invalidateRows(self):
+        # the rows to check are computed again at the next filtering
+        self.rows_to_check = None
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if self.mode == "all":
+            return True
+        model = self.sourceModel()
+        if model is None or source_row >= model._data.shape[0]:
+            return False
+        if self.mode == "to check":
+            if self.rows_to_check is None:
+                self.rows_to_check = set(rowsToCheck(model.correspondences))
+            return source_row in self.rows_to_check
+        return model._data.iloc[source_row, 6] == self.mode
 
 
 class ComboBoxItemDelegate(QStyledItemDelegate):
@@ -149,21 +199,13 @@ class ComboBoxItemDelegate(QStyledItemDelegate):
 
     def createEditor(self, parent, option, index):
 
+        # the action of a matched pair: the fate computed from the areas, or dead (a colony dead in place)
         cb = QComboBox(parent)
-        column = index.column()
-
-        if column == 6:
-            cb.addItem("born")
-            cb.addItem("gone")
-            cb.addItem("grow")
-            cb.addItem("same")
-            cb.addItem("shrink")
-            cb.addItem("n/s")
-        elif column == 7:
-            cb.addItem("none")
-            cb.addItem("fuse")
-            cb.addItem("split")
-            cb.addItem("n/s")
+        model = index.model()
+        source_index = model.mapToSource(index) if isinstance(model, QSortFilterProxyModel) else index
+        fate = source_index.model().correspondences.computedFate(source_index.row())
+        cb.addItem(fate if fate is not None else "same")
+        cb.addItem("dead")
 
         return cb
 
@@ -171,13 +213,8 @@ class ComboBoxItemDelegate(QStyledItemDelegate):
 
         cb = editor
 
-        # get the index of the text in the combobox that matches the current
-        # value of the item const
-        currentText = index.data()
-        cbIndex = cb.findText(currentText)
-        # if it is valid, adjust the combobox
-        if cbIndex >= 0:
-            cb.setCurrentIndex(cbIndex)
+        # dead is selected only if the row is already dead (closing the editor saves the selection)
+        cb.setCurrentIndex(1 if index.data() == "dead" else 0)
 
     def setModelData(self, editor, model, index):
 
@@ -225,8 +262,7 @@ height: 0px;
         self.model = None
         self.data = None
 
-        self.combodelegate1 = ComboBoxItemDelegate(self.data_table)
-        self.combodelegate2 = ComboBoxItemDelegate(self.data_table)
+        self.combodelegate = ComboBoxItemDelegate(self.data_table)
 
         self.comboboxFilter = QComboBox()
         self.comboboxFilter.setMinimumWidth(80)
@@ -236,6 +272,7 @@ height: 0px;
         self.comboboxFilter.addItem("Dead")
         self.comboboxFilter.addItem("Grow")
         self.comboboxFilter.addItem("Shrink")
+        self.comboboxFilter.addItem("To check")
 
         self.comboboxAreaMode = QComboBox()
         self.comboboxAreaMode.setMinimumWidth(80)
@@ -368,16 +405,21 @@ height: 0px;
             self.sourceImg = project.images[img1idx]
             self.targetImg = project.images[img2idx]
 
-            #FIXME this is pretty expensive, can we avoid it?
-            self.correspondences.updateAreas()
+            # the area mode chosen in the panel is kept when the pair of maps changes
+            if self.getAreaMode() == "surface area" and not self.surfaceAreaAvailable():
+                self.showMissingSurfaceArea()
+            self.correspondences.updateAreas(self.getAreaMode() == "surface area")
             self.data = self.correspondences.data
 
             if self.model is None:
 
                 self.model = TableModel(self.correspondences)
-                self.sortfilter = QSortFilterProxyModel(self)
+                if self.getAreaMode() == "surface area":
+                    self.model.enableSurfaceAreaMode()
+                self.sortfilter = MatchFilterModel(self)
                 self.sortfilter.setSourceModel(self.model)
                 self.sortfilter.setSortRole(Qt.UserRole)
+                self.sortfilter.setMode(self.comboboxFilter.currentText().lower())
                 self.data_table.setModel(self.sortfilter)
 
                 self.data_table.setVisible(False)
@@ -385,8 +427,8 @@ height: 0px;
                 self.data_table.resizeColumnsToContents()
                 self.data_table.setVisible(True)
 
-                self.data_table.setItemDelegateForColumn(5, self.combodelegate1)
-                self.data_table.setItemDelegateForColumn(6, self.combodelegate2)
+                # the drop-down list is on the Action column
+                self.data_table.setItemDelegateForColumn(6, self.combodelegate)
                 self.data_table.setEditTriggers(QAbstractItemView.DoubleClicked)
 
                 self.data_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -435,6 +477,7 @@ height: 0px;
         if self.model is None:
             return
 
+        self.sortfilter.invalidateRows()
         self.sortfilter.beginResetModel()
         self.model.beginResetModel()
         self.model._data = self.model.correspondences.data
@@ -450,6 +493,7 @@ height: 0px;
             return
 
         self.correspondences = corr
+        self.sortfilter.invalidateRows()
         self.sortfilter.beginResetModel()
         self.model.beginResetModel()
         self.model._data = corr.data
@@ -496,33 +540,64 @@ height: 0px;
         #self.data_table.model().index(row, column).data()
 
 
+    def surfaceAreaAvailable(self):
+        """
+        False if one of the two maps of the table has regions but none with the surface area computed.
+        """
+        for image in [self.sourceImg, self.targetImg]:
+            if image is None:
+                continue
+            blobs = image.annotations.seg_blobs
+            if len(blobs) > 0 and not any(float(blob.surface_area or 0.0) > 0.0 for blob in blobs):
+                return False
+        return True
+
+    def showMissingSurfaceArea(self):
+        """
+        Tell that the surface area is missing, and go back to the planar area.
+        """
+        names = [image.name for image in [self.sourceImg, self.targetImg] if image is not None and
+                 len(image.annotations.seg_blobs) > 0 and
+                 not any(float(blob.surface_area or 0.0) > 0.0 for blob in image.annotations.seg_blobs)]
+        QMessageBox.information(self, "Surface area",
+                                "The surface area has not been computed for the map " + " and ".join(names) +
+                                " (DEM > Calculate Surface Area).\nThe table shows the planar area.")
+        self.comboboxAreaMode.blockSignals(True)
+        self.comboboxAreaMode.setCurrentText("Area")
+        self.comboboxAreaMode.blockSignals(False)
+        if self.model is not None:
+            self.model.disableSurfaceAreaMode()
+
     @pyqtSlot(str)
     def changeAreaMode(self, txt):
 
-        if txt == "Area":
-            self.model.disableSurfaceAreaMode()
-        else:
-            self.model.enableSurfaceAreaMode()
+        if txt != "Area" and self.correspondences is not None and not self.surfaceAreaAvailable():
+            self.showMissingSurfaceArea()
+            txt = "Area"
 
-        self.data_table.resizeColumnsToContents()
-        self.data_table.update()
+        if self.model is not None:
+            if txt == "Area":
+                self.model.disableSurfaceAreaMode()
+            else:
+                self.model.enableSurfaceAreaMode()
+
+            self.data_table.resizeColumnsToContents()
+            self.data_table.update()
 
         self.areaModeChanged.emit(txt.lower())
 
     @pyqtSlot(str)
     def changeFilter(self, txt):
 
-        if self.data is None:
+        if self.data is None or self.sortfilter is None:
             return
 
-        if txt == 'All':
-            self.sortfilter.setFilterRegExp(QRegExp())
-        else:
-            self.sortfilter.setFilterKeyColumn(6)
-            self.sortfilter.setFilterRegExp(txt.lower())
-            self.sortfilter.setFilterRole(Qt.DisplayRole)
+        self.sortfilter.setMode(txt.lower())
 
         self.filterChanged.emit(txt.lower())
+
+    def rowsToCheck(self, corr):
+        return rowsToCheck(corr)
 
 
 

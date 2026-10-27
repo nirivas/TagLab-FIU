@@ -17,6 +17,9 @@ under the same GPL-3 licence. It changes the following.
 - **Year-to-year matching:**
   - New colonies are labelled "born" (not "dead") when a match is removed.
   - The genet CSV no longer has blank rows.
+  - Projects that could no longer be opened because of a broken comparison table now open (see "Year-to-year
+    matching" below).
+- **Opening a project:** loading a second project in the same session could fail with "connection is not unique".
 - **Custom attributes:** looking at a colony in the info panel no longer rounds its stored values.
 
 ## DEM and surface area
@@ -104,9 +107,72 @@ Alignment Tool.
   - Colonies flattened in the DEM came out `possibly gone`.
 - **Speed:** about 0.4 s per colony on a laptop CPU, much less on an NVIDIA GPU.
 
+## Year-to-year matching (Compare menu and the comparison table)
+- **The comparison tables always match the colonies.** Every tool, and every Undo and Redo, keeps them up to date on
+  both maps. Before, many edits left rows pointing to colonies that no longer existed. The table then went wrong, the
+  matching tools could crash, and some saved projects could not be opened again.
+  - A colony that is cut, merged, split, subtracted or redrawn keeps its match with the other year.
+  - Undo and Redo give back the matches too, including the undo of a delete.
+  - Colonies made by Watershed, SAM, the classifier, label-map or shapefile import and Create Negative appear in the
+    table at once (as born or dead).
+  - Deleting a colony that was part of a split or a fusion no longer links the other pieces together wrongly.
+  - Colonies whose match TagLab could not keep are shown in dark red ("to check"). These marks are now saved with
+    the project.
+- **Old projects with a broken table** open again. The broken rows are repaired: the colony left without a match
+  becomes dead or born and is marked to check. A message says how many rows were repaired. Save the project to keep
+  the repair.
+- **Correct grow / shrink / same:**
+  - It is always computed in cm² from the current outlines, so it is right after a colony is redrawn and when the two
+    maps have different pixel sizes.
+  - Splits and fusions get the fate of the whole group (e.g. a colony that split and grew in total is "grow" on each
+    row).
+- **Compute Automatic Matches:**
+  - It lines up the two maps like Carry Regions Over: same pixel grid, the georeferencing, or an offset found from
+    the images. When the maps are not on the same grid, it says how they were placed and asks: Yes uses that
+    placement, No compares the maps as they are (as before), Cancel stops.
+  - The rules are unchanged: same class, not Empty, overlap of at least 60% of the smaller colony.
+  - On the official 2013–2014 sample, "No" gives exactly the 44 matches of the sample's table. "Yes" applies the 4 mm
+    offset found between the two images, which changes 2 borderline matches.
+- **Region ids are never reused**, so a row can no longer point to the wrong colony after a deletion.
+- **Class changes:** setting a colony to Empty changes only that year. Other class changes still apply to the colony
+  in all years, and one Undo restores all of them.
+- **Undo:** the classifier results and Create Negative are each one undo step. A Delete with nothing selected no
+  longer clears the Redo history.
+- **Comparison table:**
+  - The Action column has a drop-down list (double click) on matched colonies, with the fate computed from the areas
+    or "dead", for a colony that died in place. "dead" is kept; the other values follow the areas.
+  - Split/Fuse is computed from the matches.
+  - New filter "To check" (under "Search and filter"). The "Dead" filter now finds the dead colonies.
+  - The Area / Surface Area choice is kept when you change the pair of maps. If a map has no surface area computed, a
+    message says so and the table shows the planar area.
+- **Export Matches (CSV):** one tidy file per pair of maps, ready for R or a spreadsheet:
+
+  | Columns | Meaning |
+  |---|---|
+  | `colony` | Stable name of the colony: the map and id of its first region, e.g. `2013:45`. It does not change when other colonies are edited. |
+  | `genet` | TagLab's lineage number (can change after edits) |
+  | `map1, date1, id1, class1, area1_cm2, surf_area1_cm2` | The colony in the first map (surface area empty if not computed) |
+  | `map2, date2, id2, class2, area2_cm2, surf_area2_cm2` | The same in the second map |
+  | `fate` | grow / shrink / same / dead / born |
+  | `split_fuse` | none / split / fuse |
+  | `change_cm2, change_pct` | Area change; for splits and fusions, the change of the whole group |
+  | `years` | Time between the two dates, for annual rates |
+  | `to_check` | TRUE for the dark-red rows |
+
+  The areas are rounded to 0.01 cm² and do not depend on what the table shows.
+- **Export Genet Data as CSV:** one row per colony per map, with the columns `colony, genet, map, date, id, class,
+  area_cm2, surf_area_cm2`.
+
 ## Rotate Map (Project > Rotate Map…)
 - Creates a rotated copy of a map: 90°, 180° and 270° are exact, or you can enter any angle.
 - The DEM, the colonies, the points and the georeferencing are rotated too.
+
+## Dictionaries
+- **`spongenursery.json`** (in the main folder, next to `FDEP.json`): the sponge nursery labels.
+  - Loggerhead, Yellow, Brown Branching, Vase, Sheepswool and Glove, each twice: "(Boat)" and "(Scuba)". The two of a
+    pair share a colour, light for Boat and dark for Scuba.
+  - Sand, Macroalgae, Brick and Soft Coral.
+  - Load it with Project > Labels Dictionary Editor... > Load.
 
 ## Installing and updating
 - **`install_windows.bat`:** installs everything into its own Python environment, using the package versions this

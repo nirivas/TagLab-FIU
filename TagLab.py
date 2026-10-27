@@ -1797,7 +1797,44 @@ class TagLab(QMainWindow):
             if reply != QMessageBox.Yes:
                 return
 
-        self.project.computeCorrespondences(img_source_index, img_target_index)
+        # the two maps are lined up as in Carry Regions Over: same grid, georeferencing, or offset from the images
+        source_image = self.project.images[img_source_index]
+        target_image = self.project.images[img_target_index]
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            placement = CarryOver.computePlacement(source_image, target_image, self.channelQImage(source_image),
+                                                   self.channelQImage(target_image))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        logfile.info("[MATCH] {:s} -> {:s}: {:s} ({:s})".format(source_image.id, target_image.id,
+                                                                 placement.method, placement.message))
+        M = placement.M
+        if placement.method != "same grid" or placement.warning is not None:
+            txt = placement.message
+            if placement.warning is not None:
+                txt += "\n\nWARNING: " + placement.warning
+            if placement.method == "same grid":
+                txt += "\n\nContinue?"
+                reply = QMessageBox.question(self, self.TAGLAB_VERSION, txt, QMessageBox.Yes | QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    return
+            else:
+                txt += "\n\nYes: compare the regions placed this way.\n" \
+                       "No: compare the maps as they are (same top-left corner).\nCancel: stop."
+                reply = QMessageBox.question(self, self.TAGLAB_VERSION, txt,
+                                             QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+                if reply != QMessageBox.Yes and reply != QMessageBox.No:
+                    return
+                if reply == QMessageBox.No:
+                    M = None
+                    logfile.info("[MATCH] Placement ignored: the maps are compared as they are.")
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.project.computeCorrespondences(img_source_index, img_target_index, M)
+        finally:
+            QApplication.restoreOverrideCursor()
         self.compare_panel.setTable(self.project, img_source_index, img_target_index)
         self.setTool("MATCH")
 
@@ -1832,11 +1869,20 @@ class TagLab(QMainWindow):
         filters = "CSV (*.csv)"
         filename, _ = QFileDialog.getSaveFileName(self, "Save the current matches", self.taglab_dir, filters)
 
-        if filename:
-            if self.project.correspondences is not None:
-                for key,corr in self.project.correspondences.items():
-                    filename = filename.replace('.csv','')
-                    corr.data.to_csv(filename + '_' + key + '.csv', index=False)
+        if not filename or not self.project.correspondences:
+            return
+
+        # one tidy file per pair of maps (see Correspondences.exportTidy)
+        self.project.genet.updateGenets()
+        colonies = self.project.genet.colonyNames()
+        base = filename[:-4] if filename.lower().endswith('.csv') else filename
+        for key, corr in self.project.correspondences.items():
+            corr.exportTidy(base + '_' + key + '.csv', colonies)
+
+        msgBox = QMessageBox(self)
+        msgBox.setWindowTitle(self.TAGLAB_VERSION)
+        msgBox.setText("Matches exported successfully (one file per pair of maps).")
+        msgBox.exec()
 
     @pyqtSlot()
     def toggleGrid(self):
@@ -2475,6 +2521,8 @@ class TagLab(QMainWindow):
             sourceboxes = []
             for id in sourcecluster:
                 blob = self.viewerplus.annotations.blobById(id)
+                if blob is None:  # a row naming a region that no longer exists
+                    continue
                 sourceboxes.append(blob.bbox)
                 self.viewerplus.addToSelectedList(blob)
 
@@ -2490,6 +2538,8 @@ class TagLab(QMainWindow):
             targetboxes = []
             for id in targetcluster:
                 blob = self.viewerplus2.annotations.blobById(id)
+                if blob is None:
+                    continue
                 targetboxes.append(blob.bbox)
                 self.viewerplus2.addToSelectedList(blob)
 
@@ -2522,9 +2572,13 @@ class TagLab(QMainWindow):
             correspondences = self.project.getImagePairCorrespondences(img_source_index, img_target_index)
             if correspondences:
                 data = correspondences.data
-                selection = data.loc[data["Action"] == type]
-                sourceblobs = selection['Blob1'].tolist()
-                targetblobs = selection['Blob2'].tolist()
+                if type == 'to check':
+                    rows = self.compare_panel.rowsToCheck(correspondences)
+                    selection = data.iloc[rows]
+                else:
+                    selection = data.loc[data["Action"] == type]
+                sourceblobs = set(selection['Blob1'].tolist())
+                targetblobs = set(selection['Blob2'].tolist())
                 for b in self.viewerplus.annotations.seg_blobs:
                     self.viewerplus.setBlobVisible(b, b.id in sourceblobs)
                 for b in self.viewerplus2.annotations.seg_blobs:
@@ -2549,20 +2603,48 @@ class TagLab(QMainWindow):
                 else:
                     correspondences.updateAreas(use_surface_area=False)
 
-                self.compare_panel.data_table.update()
+                self.compare_panel.updateData()
 
 
     @pyqtSlot()
     def undo(self):
         if self.activeviewer:
+            # checked before the viewer updates the tables
+            expected = self.activeviewer.undo_data.peekUndo()
+            valid = self.snapshotStillValid(expected, undo=True)
             operation = self.activeviewer.undo()
-            self.restoreCorrespondences(operation, undo=True)
+            self.restoreCorrespondences(operation, undo=True, valid=valid and operation is expected)
 
     @pyqtSlot()
     def redo(self):
         if self.activeviewer:
+            expected = self.activeviewer.undo_data.peekRedo()
+            valid = self.snapshotStillValid(expected, undo=False)
             operation = self.activeviewer.redo()
-            self.restoreCorrespondences(operation, undo=False)
+            self.restoreCorrespondences(operation, undo=False, valid=valid and operation is expected)
+
+    def snapshotStillValid(self, operation, undo):
+        """
+        The tables stored in an undo operation (attachCorrespondencesUndo) are restored only if their matches are
+        still the ones the operation left (undo) or found (redo): another step, e.g. in the other viewer, may have
+        changed them since. Otherwise the tables as updated by the undo/redo itself are kept.
+        """
+        if operation is None or 'tables' not in operation:
+            return False
+
+        tables = self.project.correspondences or {}
+        for key, (table, data_before, data_after) in operation['tables'].items():
+            expected = data_after if undo else data_before
+            current = tables.get(key)
+            if expected is None:
+                if current is not None:
+                    return False
+            elif current is not table:
+                return False
+            elif set(zip(current.data['Blob1'], current.data['Blob2'])) != \
+                    set(zip(expected['Blob1'], expected['Blob2'])):
+                return False
+        return True
 
     def snapshotCorrespondences(self, image):
         """
@@ -2587,12 +2669,12 @@ class TagLab(QMainWindow):
             states[key] = (table, data_before, data_after)
         operation['tables'] = states
 
-    def restoreCorrespondences(self, operation, undo):
+    def restoreCorrespondences(self, operation, undo, valid):
 
         if operation is None:
             return
 
-        if 'tables' in operation:
+        if 'tables' in operation and valid:
             if self.project.correspondences is None:
                 self.project.correspondences = {}
             for key, (table, data_before, data_after) in operation['tables'].items():
@@ -2604,6 +2686,8 @@ class TagLab(QMainWindow):
                 else:
                     table.data = data.copy()
                     self.project.correspondences[key] = table
+                    table.checkTable()
+                    table.refresh()
             self.project.updateGenets()
             if self.split_screen_flag and self.compare_panel.isVisible():
                 self.compare_panel.setTable(self.project, self.comboboxSourceImage.currentIndex(),
@@ -3328,14 +3412,16 @@ class TagLab(QMainWindow):
                 logfile.info("[OP-MERGE] INVALID MERGE OVERLAPPED LABELS -> blobs are separated.")
             else:
 
-                view.project.updateCorrespondences("REPLACE", view.image, [union_blob], view.selected_blobs, "")
-
-                for blob in view.selected_blobs:
+                merged = list(view.selected_blobs)
+                for blob in merged:
                     view.removeBlob(blob)
                     self.logBlobInfo(blob, "[OP-MERGE][BLOB-REMOVED]")
 
                 union_blob.data = ref_dict
                 view.addBlob(union_blob, selected=True)
+
+                # the merged region takes over the matches of the regions (after removeBlob, which keeps them for undo)
+                view.project.updateCorrespondences("REPLACE", view.image, [union_blob], merged, "")
                 view.saveUndo()
 
                 self.logBlobInfo(union_blob, "[OP-MERGE][BLOB-CREATED]")
@@ -3381,7 +3467,10 @@ class TagLab(QMainWindow):
                 view.removeBlob(selectedB)
                 view.addBlob(blobA, selected=True)
 
-                view.project.updateCorrespondences("REMOVE", None, selectedB, "")
+                # A keeps its id and its matches (with the new area), B's matches are removed (removeBlob keeps them
+                # for undo)
+                view.project.updateCorrespondences("REMOVE", view.image, None, selectedB, "")
+                view.project.updateCorrespondences("UPDATE", view.image, [blobA], selectedA, "")
 
                 view.saveUndo()
 
@@ -3462,6 +3551,7 @@ class TagLab(QMainWindow):
             for blob in created_blobs:
                 self.logBlobInfo(blob, "[OP-CREATENEGATIVE][BLOB-ADDED]")
                 view.addBlob(blob, selected=True)
+            view.saveUndo()
 
     def computeGeometricInfo(self):
         """
@@ -3776,15 +3866,15 @@ class TagLab(QMainWindow):
                 if len(created_blobs) == 0:
                     pass
                 elif len(created_blobs) == 1:
+                    # updateBlob also updates the comparison tables
                     view.updateBlob(blob, created_blobs[0], True, redraw=False)
-                    view.project.updateCorrespondences("UPDATE", created_blobs, blob, "")
                 else:
                     view.removeBlob(blob, redraw=False)
                     for created_blob in created_blobs:
                         view.addBlob(created_blob, selected=True, redraw=False)
 
-                    # FIXME: this case can be managed in a better way.
-                    view.project.updateCorrespondences("REMOVE", None, blob, "")
+                    # the pieces take over the matches of the region (after addBlob, which gives the final ids)
+                    view.project.updateCorrespondences("REPLACE", view.image, created_blobs, [blob], "")
 
                 view.saveUndo()
 
@@ -3967,8 +4057,13 @@ class TagLab(QMainWindow):
 
         # viewerplus
         # NOTE: THIS IS DIRT but the only solution viable at the moment.
-        self.project.blobClassChangedByGenet.connect(self.viewerplus.updateBlobClass, type=Qt.UniqueConnection)
-        self.project.blobClassChangedByGenet.connect(self.viewerplus2.updateBlobClass, type=Qt.UniqueConnection)
+        for viewer in [self.viewerplus, self.viewerplus2]:
+            try:
+                self.project.blobClassChangedByGenet.connect(viewer.updateBlobClass, type=Qt.UniqueConnection)
+            except TypeError:
+                # PyQt can take it for a connection of a deleted project that had the same address (the loading
+                # then failed with "connection is not unique"); a new project has no connections yet
+                self.project.blobClassChangedByGenet.connect(viewer.updateBlobClass)
 
 
     def updateAfterImport(self):
@@ -6218,8 +6313,9 @@ class TagLab(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            # ids assigned in one pass (Annotation.addBlob would look for a free id for each region)
-            next_id = max([b.id for b in target_image.annotations.seg_blobs], default=-1) + 1
+            # ids assigned in one pass, never reusing the id of a deleted region (see Annotation.getFreeId)
+            next_id = max(max([b.id for b in target_image.annotations.seg_blobs], default=-1) + 1,
+                          target_image.annotations.next_id)
             reasons = self.carryover_reasons.setdefault(target_image.id, {})
             new_blobs = []
             for r in carried:
@@ -6263,10 +6359,12 @@ class TagLab(QMainWindow):
 
             self.project.updateGenets()
 
-            # one undo step, which also restores the comparison tables
-            self.attachCorrespondencesUndo(viewer.undo_data.operation, before, target_image)
-            viewer.undo_data.operation['carryover'] = True
+            # one undo step, which also restores the comparison tables (attached after saveUndo, which updates them)
+            operation = viewer.undo_data.operation
+            operation['carryover'] = True
             viewer.saveUndo()
+            if viewer.undo_data.peekUndo() is operation:
+                self.attachCorrespondencesUndo(operation, before, target_image)
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -6439,14 +6537,8 @@ class TagLab(QMainWindow):
         viewer.tools.edit_points.reset()
         viewer.resetSelection()
         viewer.addToSelectedList(blob)
-        before = self.snapshotCorrespondences(viewer.image)
+        # Undo of the deletion restores its match (deleteSelectedBlobs stores the rows)
         viewer.deleteSelectedBlobs()
-        # Undo of the deletion also restores the comparison tables
-        operations = viewer.undo_data.operations
-        if len(operations) > 0:
-            operation = operations[viewer.undo_data.position]
-            if any(b is blob for b in operation['add']):
-                self.attachCorrespondencesUndo(operation, before, viewer.image)
         logfile.info("[CARRYOVER] Region {:d} removed.".format(target_id))
 
         self.activeviewer = viewer
@@ -6468,6 +6560,7 @@ class TagLab(QMainWindow):
             self.project = loadProject(self.taglab_dir, filename, self.default_dictionary)
             self.connectProject()
         except Exception as e:
+            QApplication.restoreOverrideCursor()
             box = QMessageBox()
             box.setWindowTitle('Failed loading the project')
             box.setText("Could not load the file " + filename + "\n" + str(e))
@@ -6496,6 +6589,17 @@ class TagLab(QMainWindow):
         logfile.info(message)
         self.updateToolStatus()
         self.groupbox_blobpanel.updateDictionary(self.project.labels)
+
+        # comparison tables left inconsistent by older versions are repaired at load (Correspondences.checkTable)
+        repaired = sum(table.repaired for table in (self.project.correspondences or {}).values())
+        if repaired > 0:
+            logfile.info("[PROJECT] {:d} rows of the comparison tables repaired at load.".format(repaired))
+            box = QMessageBox(self)
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("{:d} rows of the comparison tables did not match the regions of the maps and were "
+                        "repaired.\nThe colonies concerned are shown in dark red in the comparison table "
+                        "(filter \"To check\"). Save the project to keep the repair.".format(repaired))
+            box.exec()
 
 
     def appendProject(self, filename):
@@ -6846,6 +6950,7 @@ class TagLab(QMainWindow):
                     # the classified image is the one shown in the active viewer
                     for blob in created_blobs:
                         self.activeviewer.addBlob(blob, selected=False)
+                    self.activeviewer.saveUndo()
 
                     logfile.info("[AUTOCLASS] Automatic classification ENDS.")
 

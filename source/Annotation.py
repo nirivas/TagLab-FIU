@@ -72,6 +72,10 @@ class Annotation(object):
         # cache
         self.table_needs_update = True
 
+        # next region id: ids are never reused, because the comparison tables, the undo steps and the carried-over
+        # regions refer to them (see getFreeId)
+        self.next_id = 0
+
 
     def addPoint(self, point):
 
@@ -90,6 +94,7 @@ class Annotation(object):
         if blob.id in used:
             blob.id = self.getFreeId()
         self.seg_blobs.append(blob)
+        self.next_id = max(self.next_id, int(blob.id) + 1)
 
         self.table_needs_update = True
 
@@ -184,13 +189,13 @@ class Annotation(object):
         return last_blobs_added
 
     def getFreeId(self):
-        used = []
-        for blob in self.seg_blobs:
-            used.append(blob.id)
-        for id in range(len(used)):
-            if id not in used:
-                return id
-        return len(used)
+        """
+        A new region id, higher than every id used so far in this session (so the id of a deleted region is never
+        given to a new one). Each call returns a different id.
+        """
+        free_id = self.next_id
+        self.next_id += 1
+        return free_id
 
     def getFreePointId(self):
         used = []

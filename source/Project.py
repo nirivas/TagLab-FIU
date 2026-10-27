@@ -14,6 +14,8 @@ from source.Annotation import Annotation
 from source.Blob import Blob
 from source.Channel import Channel
 from source.Label import Label
+from source.Mask import intersectMask
+from source.Alignment import applyMatrix
 from source.Point import Point
 from source.Correspondences import Correspondences
 from source.Genet import Genet
@@ -45,6 +47,24 @@ def replacePaths(old_path, new_path, images, taglab_dir):
             filename = os.path.join(new_path, os.path.basename(image.georef_filename))
             if os.path.exists(filename):
                 image.georef_filename = taglab_dir.relativeFilePath(filename)
+
+
+def regionsOverlap(blob1, blob2):
+    """
+    True if the two regions (of the same map) are pieces of each other: they share at least half of the smaller one
+    (e.g. a piece of a cut and the region before the cut; regions that only touch along a border do not count).
+    """
+    t1, l1, w1, h1 = [int(v) for v in blob1.bbox]
+    t2, l2, w2, h2 = [int(v) for v in blob2.bbox]
+    if l1 >= l2 + w2 or l2 >= l1 + w1 or t1 >= t2 + h2 or t2 >= t1 + h1:
+        return False
+    mask1 = blob1.getMask()
+    mask2 = blob2.getMask()
+    result = intersectMask(mask1, [t1, l1, w1, h1], mask2, [t2, l2, w2, h2])
+    if result is None:
+        return False
+    smaller = min(np.count_nonzero(mask1), np.count_nonzero(mask2))
+    return smaller > 0 and np.count_nonzero(result[0]) >= 0.5 * smaller
 
 
 def loadProject(taglab_working_dir, filename, default_dict):
@@ -234,6 +254,14 @@ class Project(QObject):
                 self.correspondences[key] = Correspondences(self.getImageFromId(source), self.getImageFromId(target))
                 self.correspondences[key].fillTable(correspondences[key]['correspondences'])
 
+            # new region ids also skip the ids named in the tables
+            for table in self.correspondences.values():
+                if len(table.data.index) > 0:
+                    table.source.annotations.next_id = max(table.source.annotations.next_id,
+                                                           int(table.data['Blob1'].max()) + 1)
+                    table.target.annotations.next_id = max(table.target.annotations.next_id,
+                                                           int(table.data['Blob2'].max()) + 1)
+
         self.genet = Genet(self)
         self.region_attributes = RegionAttributes(**region_attributes)
 
@@ -301,16 +329,12 @@ class Project(QObject):
 
     def save(self, filename=None):
 
-        # check inconsistencies. They can be caused by bugs during the regions update/editing
+        # repair inconsistencies (rows naming regions that no longer exist, regions missing from a table)
         if self.correspondences is not None:
-            for key in self.correspondences.keys():
-                if self.correspondences[key].checkTable() is True:
-                    # there are inconsistencies, THIS MUST BE NOTIFIED
-                    msgBox = QMessageBox()
-                    msgBox.setWindowTitle("INCONSISTENT CORRESPONDENCES")
-                    msgBox.setText(
-                        "Inconsistent correspondences has been found !!\nPlease, Notify this problem to the TagLab developers.")
-                    msgBox.exec()
+            repaired = sum(table.checkTable() for table in self.correspondences.values())
+            if repaired > 0:
+                self.updateGenets()
+                self.correspTableChanged.emit()
 
         data = self.__dict__
         str = json.dumps(data, cls=ProjectEncoder, indent=1)
@@ -591,166 +615,256 @@ class Project(QObject):
                 self.blobClassChanged.emit(img, old_class_name, blob)
 
     def updateCorrespondences(self, operation, img, blobs_added, blob_removed, class_name=""):
+        """
+        Update the comparison tables of the map img after an edit. blob_removed is a region or a list of regions.
+        """
 
-        flag_update_table = False
+        if operation == "CLASS_CHANGED":
+            # The class is updated along the entire temporal sequence, except Empty (it concerns only this map).
+            blob = blobs_added[0]
+            if class_name != "Empty":
+                self.assignClassByGenet(class_name, blob.genet)
+            for table in self.findCorrespTables(img):
+                table.refresh()
+            self.correspTableChanged.emit()
+            return
+
+        if operation not in ["ADD", "REMOVE", "UPDATE", "REPLACE"]:
+            print("Update correspondences WARNING! -> unknown operation")
+            return
+
+        tables = self.findCorrespTables(img) if img is not None else []
+        if len(tables) == 0:
+            return
+
+        removed = blob_removed if isinstance(blob_removed, list) else [blob_removed]
 
         if operation == "ADD":
             # WARNING: correspondences are not updated automatically!
-            # The involved tables are updated considering the blobs added a 'born' or 'dead'.
-            # Eventual correspondence must be added manually by the user!
-            # TODO: ADD MESSAGE FOR THE USER
+            # The new regions are 'born' (target map) or 'dead' (source map) until the user matches them.
             for blob in blobs_added:
                 blob.correspondence_to_check = True
-
-            corresp_tables = self.findCorrespTables(img)
-            if len(corresp_tables) > 0:
-                for table in corresp_tables:
-                    is_source = table.isSource(img)
-                    if is_source is True:
-                        table.set(blobs_added, [])
-                    else:
-                        table.set([], blobs_added)
-
-                self.updateGenets()
-
-                flag_update_table = True
+            for table in tables:
+                table.addUnmatched(blobs_added, table.isSource(img))
 
         elif operation == "REMOVE":
-            # All the involved rows are deleted. Target and source blobs are connected together if any.
-            # The genet is recomputed for consistency.
-
-            corresp_tables = self.findCorrespTables(img)
-
-            if len(corresp_tables) > 0:
-                for table in corresp_tables:
-                    is_source = table.isSource(img)
-                    source_blobs_ids, target_blobs_ids, rows_indexes = table.findCluster(blob_removed.id, is_source)
-                    if is_source:
-                        source_blobs_ids.remove(blob_removed.id)
-                    else:
-                        target_blobs_ids.remove(blob_removed.id)
-
-                    table.deleteRows(rows_indexes)
-                    source_blobs = table.sourceBlobsById(source_blobs_ids)
-                    target_blobs = table.targetBlobsById(target_blobs_ids)
-                    table.set(source_blobs, target_blobs)
-
-                    blobs = source_blobs + target_blobs
-                    for blob in blobs:
-                        blob.correspondence_to_check = True
-
-                self.updateGenets()
-
-                flag_update_table = True
+            # The rows of the removed regions are deleted. Partners left without any match become dead or born;
+            # the other matches are not changed.
+            for table in tables:
+                is_source = table.isSource(img)
+                partners = table.removeRegions([blob.id for blob in removed], is_source)
+                self.markToCheck(table, partners, not is_source)
 
         elif operation == "UPDATE":
-            # The content of the correspondences tables involved is updated, blobs_added contains the new information,
-            # blob_removed the old information.
-            corresp_tables = self.findCorrespTables(img)
-            if len(corresp_tables) > 0:
-                for table in corresp_tables:
-                    table.updateBlobId(img, blob_removed.id, blobs_added[0].id)
-                    table.updateBlobArea(img, blob_removed.id, blobs_added[0].area, blobs_added[0].surface_area)
-
-                flag_update_table = True
+            # Same region id with a new outline: the areas and the fates are recomputed (finishTablesUpdate).
+            pass
 
         elif operation == "REPLACE":
-            # The blobs added are connected automatically with the ones of the blob removed (if more than one blob is
-            # removed, the removed_blob is a list of blobs)
-            # The genet is recomputed for consistency.
+            # The added regions take over the matches of the removed ones: one region replaced by N (e.g. CUT) or
+            # N regions replaced by one (e.g. MERGE).
+            for blob in blobs_added:
+                blob.correspondence_to_check = True
+            for table in tables:
+                is_source = table.isSource(img)
+                partners = table.replaceRegions([blob.id for blob in removed], blobs_added, is_source)
+                self.markToCheck(table, partners, not is_source)
 
-            corresp_tables = self.findCorrespTables(img)
+        self.finishTablesUpdate(tables)
 
-            if len(corresp_tables) > 0:
+    def finishTablesUpdate(self, tables):
+        """
+        After the rows of some tables changed: areas, fates and genets are recomputed, and the panel is updated.
+        """
+        for table in tables:
+            table.refresh()
+            table.sort_data()
 
-                if len(blob_removed) == 1:
-                    # one blob is replaced by N blobs, for example this is the case of a CUT operation
+        self.updateGenets()
+        self.correspTableChanged.emit()
 
-                    for table in corresp_tables:
+    def markToCheck(self, table, ids, is_source):
+        """
+        Mark the given regions (of the source map of the table if is_source) to be checked in the comparison table.
+        """
+        image = table.source if is_source else table.target
+        ids = set(ids)
+        for blob in image.annotations.seg_blobs:
+            if blob.id in ids:
+                blob.correspondence_to_check = True
 
-                        is_source = table.isSource(img)
+    def syncCorrespondences(self, img, added, removed):
+        """
+        Keep the comparison tables of the map consistent with its regions after an editing step, or after its undo
+        or redo: added and removed are the regions the step added and removed. Tools that update the tables
+        themselves leave nothing to do. Otherwise, an added region covering removed ones takes over their matches
+        (e.g. the undo of a cut, or the redo of a merge, whose region keeps the id of one of the merged ones), the
+        other new regions become born or dead, and the matches of the removed regions are deleted. Finally the areas
+        and the fates are recomputed.
+        """
+        if img is None or (len(added) == 0 and len(removed) == 0):
+            return
 
-                        source_blobs_ids, target_blobs_ids, rows_indexes = table.findCluster(blob_removed[0].id, is_source)
+        tables = self.findCorrespTables(img) if self.correspondences else []
+        if len(tables) == 0:
+            return
 
-                        # remove the current connections from the correspondences' table
-                        table.deleteRows(rows_indexes)
+        # a region both added and removed (e.g. created and then undone by a tool) is no change
+        both = set(id(blob) for blob in added) & set(id(blob) for blob in removed)
+        present = {blob.id: blob for blob in img.annotations.seg_blobs}
+        added = [blob for blob in added if id(blob) not in both and present.get(blob.id) is blob]
+        removed = [blob for blob in removed if id(blob) not in both]
 
-                        # create the new correspondences
-                        if is_source:
-                            source_blobs_ids.remove(blob_removed[0].id)
-                        else:
-                            target_blobs_ids.remove(blob_removed[0].id)
+        for table in tables:
+            is_source = table.isSource(img)
+            column, _ = table.columns(is_source)
+            referenced = set(table.data[column])
 
-                        source_blobs = table.sourceBlobsById(source_blobs_ids)
-                        target_blobs = table.targetBlobsById(target_blobs_ids)
+            gone = {}
+            for blob in removed:
+                if blob.id in referenced and blob.id not in present:
+                    gone[blob.id] = blob
+            new = []
+            seen = set()
+            for blob in added:
+                if id(blob) not in seen:
+                    seen.add(id(blob))
+                    new.append(blob)
 
-                        if is_source:
-                            table.set(blobs_added, target_blobs)
-                        else:
-                            table.set(source_blobs, blobs_added)
+            if len(gone) == 0 and all(blob.id in referenced for blob in new):
+                continue
 
-                        blobs = blobs_added + source_blobs + target_blobs
-                        for blob in blobs:
-                            blob.correspondence_to_check = True
+            # groups of overlapping new and gone regions (the pieces of the same colony)
+            group_of = {('g', gid): ('g', gid) for gid in gone}
+            group_of.update({('n', i): ('n', i) for i in range(len(new))})
+
+            def root(k):
+                while group_of[k] != k:
+                    k = group_of[k]
+                return k
+
+            for i, blob in enumerate(new):
+                for gid, old in gone.items():
+                    if regionsOverlap(blob, old):
+                        group_of[root(('n', i))] = root(('g', gid))
+
+            groups = {}
+            for k in group_of:
+                group = groups.setdefault(root(k), ([], []))
+                if k[0] == 'g':
+                    group[0].append(k[1])
                 else:
-                    # some blobs are replaced by one blob, for example this is the case of a MERGE operation
-                    for table in corresp_tables:
+                    group[1].append(new[k[1]])
 
-                        is_source = table.isSource(img)
+            lonely_gone = []
+            lonely_new = []
+            for gone_ids, new_blobs in groups.values():
+                if len(gone_ids) > 0 and len(new_blobs) > 0:
+                    for blob in new_blobs:
+                        blob.correspondence_to_check = True
+                    partners = table.replaceRegions(gone_ids, new_blobs, is_source)
+                    self.markToCheck(table, partners, not is_source)
+                elif len(gone_ids) > 0:
+                    lonely_gone += gone_ids
+                else:
+                    lonely_new += new_blobs
 
-                        # find all the connections
-                        all_source_blobs_ids = []
-                        all_target_blobs_ids = []
-                        all_rows = []
-                        for blob in blob_removed:
-                            source_blobs_ids, target_blobs_ids, rows_indexes = table.findCluster(blob.id, is_source)
+            # in one go (e.g. the undo of a label map import)
+            if len(lonely_gone) > 0:
+                partners = table.removeRegions(lonely_gone, is_source)
+                self.markToCheck(table, partners, not is_source)
+            # the regions not in the table yet become dead or born
+            lonely_new = [blob for blob in lonely_new if blob.id not in referenced]
+            for blob in lonely_new:
+                blob.correspondence_to_check = True
+            table.addUnmatched(lonely_new, is_source)
 
-                            # new correspondences to crea
-                            if is_source:
-                                source_blobs_ids.remove(blob.id)
-                            else:
-                                target_blobs_ids.remove(blob.id)
+        self.finishTablesUpdate(tables)
 
-                            all_source_blobs_ids += source_blobs_ids
-                            all_target_blobs_ids += target_blobs_ids
-                            all_rows += rows_indexes
+    def matchRows(self, img, blobs):
+        """
+        The matches of the given regions of the map, so that restoreMatchRows can give them back exactly (e.g. when
+        a deletion is undone): [(table key, the map is the source, id1, id2, to check 1, to check 2)], with id2 = -1
+        (id1 = -1) for a region of the source (target) map without matches. Regions not in a table are not listed.
+        """
+        ids = set(blob.id for blob in blobs)
+        rows = []
+        for key, table in (self.correspondences or {}).items():
+            if table.source is img:
+                column = 'Blob1'
+            elif table.target is img:
+                column = 'Blob2'
+            else:
+                continue
+            data = table.data
+            selected = data[data[column].isin(ids)]
+            src, tgt = table.regionsById()
+            matched = set()
+            for id1, id2 in zip(selected['Blob1'], selected['Blob2']):
+                id1 = int(id1)
+                id2 = int(id2)
+                if id1 >= 0 and id2 >= 0:
+                    matched.add(id1 if column == 'Blob1' else id2)
+                    rows.append((key, column == 'Blob1', id1, id2,
+                                 src[id1].correspondence_to_check if id1 in src else False,
+                                 tgt[id2].correspondence_to_check if id2 in tgt else False))
+            for i in sorted(set(int(i) for i in selected[column]) - matched):
+                if column == 'Blob1':
+                    rows.append((key, True, i, -1, src[i].correspondence_to_check if i in src else False, False))
+                else:
+                    rows.append((key, False, -1, i, False, tgt[i].correspondence_to_check if i in tgt else False))
+        return rows
 
-                        # remove such rows from the correspondences' table
-                        table.deleteRows(all_rows)
+    def restoreMatchRows(self, rows):
+        """
+        Give back to the regions saved by matchRows exactly the matches they had (e.g. when a deletion is undone):
+        their current rows are replaced, and the partners that no longer exist are skipped. The other matches of the
+        partners are kept.
+        """
+        saved = {}   # (key, side) -> {id: (partner ids, to check, partners to check)}
+        for (key, is_source, id1, id2, check1, check2) in rows:
+            if is_source:
+                blob_id, partner, check, partner_check = id1, id2, check1, check2
+            else:
+                blob_id, partner, check, partner_check = id2, id1, check2, check1
+            entry = saved.setdefault((key, is_source), {}).setdefault(blob_id, ([], check, {}))
+            if partner >= 0 and partner not in entry[2]:
+                entry[0].append(partner)
+                entry[2][partner] = partner_check
 
-                        # remove duplicated ids
-                        all_source_blobs_ids = list(set(all_source_blobs_ids))
-                        all_target_blobs_ids = list(set(all_target_blobs_ids))
+        changed = []
+        for (key, is_source), entries in saved.items():
+            table = (self.correspondences or {}).get(key)
+            if table is None:
+                continue
+            src, tgt = table.regionsById()
+            regions = src if is_source else tgt
+            others = tgt if is_source else src
+            entries = {blob_id: entry for blob_id, entry in entries.items() if blob_id in regions}
+            if len(entries) == 0:
+                continue
 
-                        # re-create the connections
-                        source_blobs = table.sourceBlobsById(all_source_blobs_ids)
-                        target_blobs = table.targetBlobsById(all_target_blobs_ids)
+            # the current rows of the regions are replaced (in one go)
+            table.removeRegions(list(entries), is_source)
+            pairs = []
+            lonely = []
+            for blob_id, (partner_ids, check, partner_checks) in entries.items():
+                # a partner removed meanwhile (e.g. cut in the other map) cannot be matched again: to check
+                lost = any(p not in others for p in partner_ids)
+                partner_ids = [p for p in partner_ids if p in others]
+                if len(partner_ids) > 0:
+                    pairs += [(blob_id, p) if is_source else (p, blob_id) for p in partner_ids]
+                else:
+                    lonely.append(regions[blob_id])
+                regions[blob_id].correspondence_to_check = check or lost
+                for p in partner_ids:
+                    others[p].correspondence_to_check = partner_checks[p]
+            table.linkPairs(pairs)
+            table.addUnmatched(lonely, is_source)
+            if not any(t is table for t in changed):
+                changed.append(table)
 
-                        if is_source:
-                            table.set(blobs_added, target_blobs)
-                        else:
-                            table.set(source_blobs, blobs_added)
-
-                        blobs = blobs_added + source_blobs + target_blobs
-                        for blob in blobs:
-                            blob.correspondence_to_check = True
-
-                self.updateGenets()
-
-                flag_update_table = True
-
-        elif operation == "CLASS_CHANGED":
-            # The class is updated along the entire temporal sequence.
-            blob = blobs_added[0]
-            self.assignClassByGenet(class_name, blob.genet)
-            flag_update_table = True
-
-        else:
-            print("Update correspondences WARNING! -> unknown operation")
-
-        # update the table in the comparison panel
-        if flag_update_table:
-            self.correspTableChanged.emit()
+        if len(changed) > 0:
+            self.finishTablesUpdate(changed)
 
     def addPoint(self, img, point, notify=True):
 
@@ -865,31 +979,31 @@ class Project(QObject):
         for corr in corresp_tables:
             corr.updateAreas(use_surface_area=flag_surface_area)
 
-    def computeCorrespondences(self, img_source_idx, img_target_idx):
+    def computeCorrespondences(self, img_source_idx, img_target_idx, M=None):
         """
-        Compute the correspondences between an image pair.
+        Compute the correspondences between an image pair (see Correspondences.autoMatch). M (2 x 3) places the
+        pixels of the source map on the target map (see CarryOver.computePlacement); by default the two maps share
+        the top-left corner and only their pixel sizes differ. The regions are compared in the target pixels.
         """
+        source = self.images[img_source_idx]
+        target = self.images[img_target_idx]
 
-        conversion1 = self.images[img_source_idx].pixelSize()
-        conversion2 = self.images[img_target_idx].pixelSize()
+        if M is None:
+            s = source.pixelSize() / target.pixelSize()
+            M = np.array([[s, 0.0, 0.5 * (s - 1.0)], [0.0, s, 0.5 * (s - 1.0)]])
 
-        # switch form px to mm just for calculation (except areas that are in cm)
-
+        # the source regions placed on the target map (outlines and holes)
         blobs1 = []
-        for blob in self.images[img_source_idx].annotations.seg_blobs:
+        for blob in source.annotations.seg_blobs:
             blob_c = blob.copy()
-            blob_c.bbox = (blob_c.bbox * conversion1).round().astype(int)
-            blob_c.contour = blob_c.contour * conversion1
-            blob_c.area = blob_c.area * conversion1 * conversion1 / 100
+            blob_c.contour = applyMatrix(M, blob.contour)
+            blob_c.inner_contours = [applyMatrix(M, inner) for inner in blob.inner_contours]
+            x0, y0 = np.floor(blob_c.contour.min(axis=0))
+            x1, y1 = np.ceil(blob_c.contour.max(axis=0))
+            blob_c.bbox = np.array([int(y0), int(x0), int(x1 - x0) + 1, int(y1 - y0) + 1])
             blobs1.append(blob_c)
 
-        blobs2 = []
-        for blob in self.images[img_target_idx].annotations.seg_blobs:
-            blob_c = blob.copy()
-            blob_c.bbox = (blob_c.bbox * conversion2).round().astype(int)
-            blob_c.contour = blob_c.contour * conversion2
-            blob_c.area = blob_c.area * conversion2 * conversion2 / 100
-            blobs2.append(blob_c)
+        blobs2 = list(target.annotations.seg_blobs)
 
         # create correspondences table
         if self.correspondences is None:
@@ -901,15 +1015,19 @@ class Project(QObject):
         #corr.autoMatchM(blobs1, blobs2)   # autoMatchM resolves matching taking into account live/dead specimens (class name constraint is removed)
 
         lines = corr.correspondences + corr.dead + corr.born
+        corr.correspondences = []
+        corr.dead = []
+        corr.born = []
 
         if len(lines) > 0:
-            corr.data = pd.DataFrame(lines, columns=corr.data.columns)
+            corr.appendRows(lines)
+            # areas (cm^2, in the area mode of the table) and fates from the regions
+            corr.refresh()
             corr.sort_data()
-            corr.correspondence = []
-            corr.dead = []
-            corr.born = []
 
         self.genet.updateGenets()
+        self.correspTableChanged.emit()
+        return corr
 
     def create_labels_table(self, image):
 

@@ -549,6 +549,9 @@ class Blob(object):
         dic["id"] = self.id
         dic["note"] = self.note
         dic["data"] = self.data.copy()
+        if self.correspondence_to_check:
+            # highlighted in the comparison table (read back by fromDict)
+            dic["correspondence_to_check"] = True
 
         return dic
 

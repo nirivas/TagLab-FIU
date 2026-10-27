@@ -45,13 +45,15 @@ class SplitBlob(Tool):
 
         self.viewerplus.removeBlob(selected_blob)
         created_blobs = self.viewerplus.annotations.splitBlob(self.viewerplus.img_map, selected_blob, points)
-        self.viewerplus.project.updateCorrespondences("SPLIT", created_blobs, selected_blob, "")
 
         self.blobInfo.emit(selected_blob, "[TOOL][SPLITBLOB][BLOB-SELECTED]")
 
         for blob in created_blobs:
             self.viewerplus.addBlob(blob, selected=True)
             self.blobInfo.emit(blob, "[TOOL][SPLITBLOB][BLOB-CREATED]")
+
+        # the pieces take over the matches of the region (after addBlob, which gives the final ids)
+        self.viewerplus.project.updateCorrespondences("REPLACE", self.viewerplus.image, created_blobs, [selected_blob], "")
 
         self.log.emit("[TOOL][SPLITBLOB] Operation ends.")
 

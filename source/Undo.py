@@ -14,20 +14,32 @@ class Undo(object):
         self.operation['remove'].append(blob)
 
     def removeBlob(self, blob):
-        self.operation['add'].append(blob)
+        # a region removed twice in the same step (e.g. replaced by several pieces) is restored only once
+        if not any(b is blob for b in self.operation['add']):
+            self.operation['add'].append(blob)
 
     def setBlobClass(self, blob, class_name):
         self.operation['class'].append((blob, blob.class_name))
         self.operation['newclass'].append((blob, class_name))
 
     def saveUndo(self):
-        #clip future redo, invalidated by a new change
-        self.operations = self.operations[:self.position+1]
         """
         Will mark an undo step using the previously added and removed blobs.
         """
+        # a region both added and removed in this step (e.g. created and then undone by a tool) is no change
+        removed = {id(b) for b in self.operation['add']}
+        both = {id(b) for b in self.operation['remove'] if id(b) in removed}
+        if both:
+            self.operation['remove'] = [b for b in self.operation['remove'] if id(b) not in both]
+            self.operation['add'] = [b for b in self.operation['add'] if id(b) not in both]
+
         if len(self.operation['add']) == 0 and len(self.operation['remove']) == 0 and len(self.operation['class']) == 0:
+            # nothing to undo: the pending step starts again, without what was recorded for its regions
+            self.operation = { 'remove':[], 'add':[], 'class':[], 'newclass':[] }
             return
+
+        #clip future redo, invalidated by a new change (only by a real change: an empty step keeps the redo)
+        self.operations = self.operations[:self.position+1]
 
         self.operations.append(self.operation)
         self.operation = { 'remove':[], 'add':[], 'class':[], 'newclass':[] }
@@ -53,3 +65,15 @@ class Undo(object):
         self.position += 1
         operation = self.operations[self.position]
         return operation
+
+    def peekUndo(self):
+        """The operation the next undo() returns, without moving."""
+        if self.position < 0 or self.position >= len(self.operations):
+            return None
+        return self.operations[self.position]
+
+    def peekRedo(self):
+        """The operation the next redo() returns, without moving."""
+        if self.position >= len(self.operations) - 1:
+            return None
+        return self.operations[self.position + 1]

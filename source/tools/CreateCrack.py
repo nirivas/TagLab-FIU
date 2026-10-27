@@ -44,19 +44,21 @@ class CreateCrack(Tool):
     def crackApply(self):
 
         new_blobs = self.viewerplus.crackWidget.apply()
-        self.blobInfo.emit(self.viewerplus.selected_blobs[0], "[TOOL][CREATECRACK][BLOB-SELECTED]")
+        original = self.viewerplus.selected_blobs[0]
+        self.blobInfo.emit(original, "[TOOL][CREATECRACK][BLOB-SELECTED]")
         #self.viewerplus.removeBlob(self.viewerplus.selected_blobs[0])
 
         if len(new_blobs) == 1:
-            self.viewerplus.updateBlob(self.viewerplus.selected_blobs[0], new_blobs[0])
+            self.viewerplus.updateBlob(original, new_blobs[0])
             self.blobInfo.emit(new_blobs[0], "[TOOL][CREATECRACK][BLOB-EDITED]")
         else:
-            self.viewerplus.removeBlob(self.viewerplus.selected_blobs[0])
+            self.viewerplus.removeBlob(original)
             for blob in new_blobs:
                 self.viewerplus.addBlob(blob, selected=True)
                 self.blobInfo.emit(blob, "[TOOL][CREATECRACK][BLOB-EDITED]")
 
-            self.viewerplus.project.updateCorrespondences("CRACK", new_blobs, self.viewerplus.selected_blobs[0], "")
+            # the pieces take over the matches of the region
+            self.viewerplus.project.updateCorrespondences("REPLACE", self.viewerplus.image, new_blobs, [original], "")
 
         self.viewerplus.saveUndo()
         self.crackCancel()

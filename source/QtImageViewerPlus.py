@@ -1629,7 +1629,22 @@ class QtImageViewerPlus(QtImageViewer):
         if redraw:
             self.scene.invalidate()
 
+    def captureMatches(self, blobs):
+        """
+        Keep in the pending undo step the matches of the regions the step removes, as they are before the step
+        changes the comparison tables, so that undo gives them back exactly (see Project.restoreMatchRows).
+        """
+        if self.project is None:
+            return
+        operation = self.undo_data.operation
+        captured = operation.setdefault('captured', set())
+        new = [blob for blob in blobs if id(blob) not in captured]
+        if len(new) > 0:
+            operation['rows'] = operation.get('rows', []) + self.project.matchRows(self.image, new)
+            captured.update(id(blob) for blob in new)
+
     def removeBlobs(self, blobs):
+        self.captureMatches(blobs)
         for blob in blobs:
             self.removeFromSelectedList(blob, redraw=False)
             self.undrawBlob(blob, redraw=False)
@@ -1661,6 +1676,7 @@ class QtImageViewerPlus(QtImageViewer):
 
         else:
 
+            self.captureMatches([blob])
             self.removeFromSelectedList(blob, redraw=False)
             self.undrawBlob(blob)
             self.undo_data.removeBlob(blob)
@@ -1671,6 +1687,7 @@ class QtImageViewerPlus(QtImageViewer):
 
     def updateBlob(self, old_blob, new_blob, selected=False, redraw=True):
 
+        self.captureMatches([old_blob])
         self.project.updateBlob(self.image, old_blob, new_blob)
 
         self.removeFromSelectedList(old_blob, redraw=False)
@@ -1695,8 +1712,9 @@ class QtImageViewerPlus(QtImageViewer):
 
         if len(self.selected_blobs) > 0:
 
-            for blob in self.selected_blobs:
-                self.project.updateCorrespondences("REMOVE", self.image, None, blob, "")
+            # the matches of the deleted regions are kept in the undo step, so that undo gives them back
+            self.captureMatches(self.selected_blobs)
+            self.project.updateCorrespondences("REMOVE", self.image, None, list(self.selected_blobs), "")
 
             self.removeBlobs(self.selected_blobs)
 
@@ -1745,10 +1763,11 @@ class QtImageViewerPlus(QtImageViewer):
             self.scene.invalidate()
 
     def updateBlobClass(self, img, class_name, blob):
-
+        """
+        A class change spread to this map along the colony's lineage: only the drawing changes. The undo step is in
+        the map where the class was changed (its undo spreads the old class again).
+        """
         if self.image == img:
-            self.undo_data.setBlobClass(blob, class_name)
-
             if blob.qpath_gitem:
                 brush = self.project.classBrushFromName(blob)
                 blob.qpath_gitem.setBrush(brush)
@@ -1769,6 +1788,11 @@ class QtImageViewerPlus(QtImageViewer):
 ###### UNDO STUFF #####
 
     def saveUndo(self):
+        operation = self.undo_data.operation
+        # the comparison tables follow the regions added and removed in this step (a safety net for the tools that
+        # do not update them)
+        if self.project is not None:
+            self.project.syncCorrespondences(self.image, operation['remove'], operation['add'])
         self.undo_data.saveUndo()
 
     def undo(self):
@@ -1812,6 +1836,12 @@ class QtImageViewerPlus(QtImageViewer):
             self.selectionChanged.emit()
             self.drawBlob(blob)
 
+        # the comparison tables follow, and the regions brought back get exactly the matches they had; this comes
+        # before the class changes, which use the lineages
+        self.project.syncCorrespondences(self.image, operation['add'], operation['remove'])
+        if 'rows' in operation:
+            self.project.restoreMatchRows(operation['rows'])
+
         for (blob, class_name) in operation['class']:
             self.project.setBlobClass(self.image, blob, class_name)
             brush = self.project.classBrushFromName(blob)
@@ -1829,6 +1859,10 @@ class QtImageViewerPlus(QtImageViewer):
         if operation is None:
             return
 
+        if 'rows' in operation:
+            # the matches of the regions deleted again, as they are now
+            operation['rows'] = self.project.matchRows(self.image, operation['add'])
+
         for blob in operation['add']:
             message = "[REDO][ADD] BLOBID={:d} VERSION={:d}".format(blob.id, blob.version)
             self.logfile.info(message)
@@ -1843,6 +1877,8 @@ class QtImageViewerPlus(QtImageViewer):
             self.selected_blobs.append(blob)
             self.selectionChanged.emit()
             self.drawBlob(blob)
+
+        self.project.syncCorrespondences(self.image, operation['remove'], operation['add'])
 
         for (blob, class_name) in operation['newclass']:
             self.project.setBlobClass(self.image, blob, class_name)

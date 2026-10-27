@@ -30,12 +30,14 @@ class Genet:
         parents = []
 
         count = len(parents)
+        regions = {}  # image -> {id: region}
         for img in self.project.images:
             sorted_blobs = sorted(img.annotations.seg_blobs, key=lambda x: x.id)
             for blob in sorted_blobs:
                 blob.genet = count
                 parents.append(count)
                 count += 1
+            regions[id(img)] = {blob.id: blob for blob in sorted_blobs}
 
         def root(p): 
             while p != parents[p]:
@@ -47,14 +49,17 @@ class Genet:
             r1 = root(p1)
             parents[r1] = r0
 
-        for corrs in self.project.correspondences.values():
-            for index, row in corrs.data.iterrows():
-                id1 = int(row['Blob1'])
-                id2 = int(row['Blob2'])
-                if id1 == -1 or id2 == -1:  #born or dead corals
+        tables = list((self.project.correspondences or {}).values())
+        for corrs in tables:
+            source = regions.get(id(corrs.source), {})
+            target = regions.get(id(corrs.target), {})
+            for id1, id2 in zip(corrs.data['Blob1'], corrs.data['Blob2']):
+                if id1 < 0 or id2 < 0:  #born or dead corals
                     continue
-                blob1 = corrs.source.annotations.blobById(id1)
-                blob2 = corrs.target.annotations.blobById(id2)
+                blob1 = source.get(int(id1))
+                blob2 = target.get(int(id2))
+                if blob1 is None or blob2 is None:  # a row naming a region that no longer exists
+                    continue
 
                 if blob1.genet != blob2.genet:
                     link(blob1.genet, blob2.genet)
@@ -73,17 +78,32 @@ class Genet:
                 blob.genet = remap[blob.genet]
 
          #update corrs genets.
-        for corrs in self.project.correspondences.values():            
-            for index, row in corrs.data.iterrows():
-                id1 = int(row['Blob1'])
-                id2 = int(row['Blob2'])
-                
-                if id1 != -1:
-                    blob1 = corrs.source.annotations.blobById(id1)
-                    corrs.data.loc[index, 'Genet'] = blob1.genet
-                else:
-                    blob2 = corrs.target.annotations.blobById(id2)
-                    corrs.data.loc[index, 'Genet'] = blob2.genet
+        for corrs in tables:
+            source = regions.get(id(corrs.source), {})
+            target = regions.get(id(corrs.target), {})
+            genets = []
+            for id1, id2 in zip(corrs.data['Blob1'], corrs.data['Blob2']):
+                blob = source.get(int(id1)) if id1 >= 0 else target.get(int(id2))
+                genets.append(blob.genet if blob is not None else -1)
+            corrs.data['Genet'] = genets
+
+    def colonyNames(self):
+        """
+        A stable name for each colony (lineage of matched regions): the map name and the id of its first region,
+        e.g. "2013:45" (the first map in the project order, the smallest id there). Unlike the genet number, it does
+        not change when other colonies are edited. Returns {(image id, region id): name}.
+        """
+        first = {}
+        for img in self.project.images:
+            for blob in sorted(img.annotations.seg_blobs, key=lambda x: x.id):
+                if blob.genet is not None and blob.genet not in first:
+                    first[blob.genet] = img.name + ":" + str(blob.id)
+
+        names = {}
+        for img in self.project.images:
+            for blob in img.annotations.seg_blobs:
+                names[(img.id, blob.id)] = first.get(blob.genet)
+        return names
 
 
 
@@ -104,59 +124,45 @@ class Genet:
         return path
 
     def exportCSV(self, filename):
-        fields = ['genet']
-
+        """
+        One line per region per map (long format, e.g. for R): colony, genet, map, date, id, class, area_cm2,
+        surf_area_cm2 (empty if not computed). Only the regions inside the working area, if there is one.
+        """
         working_area = self.project.working_area
-        self.blobs =[]
+        colonies = self.colonyNames()
+        lines = []
 
-        for img in self.project.images:
-            # writing both classes seems redundant in matching, but it's not for born and dead
-            fields.append(img.name + " Class name")
-            fields.append(img.name + " Object id")
-            fields.append(img.name + " Area")
-        lines = {}
-
-        for img in self.project.images:
+        for order, img in enumerate(self.project.images):
             if working_area is None:
                 blobs = img.annotations.seg_blobs
             else:
                 blobs = img.annotations.calculate_inner_blobs(working_area)
 
-            self.blobs.append(blobs)
+            px = img.pixelSize()
+            for blob in sorted(blobs, key=lambda x: x.id):
+                area = round(blob.area * px * px / 100, 2)
+                surface = float(blob.surface_area or 0.0)
+                surface = round(surface * px * px / 100, 2) if surface > 0.0 else ""
+                lines.append((colonies.get((img.id, blob.id)) or "", order,
+                              [colonies.get((img.id, blob.id)) or "", blob.genet, img.name, img.acquisition_date,
+                               blob.id, blob.class_name, area, surface]))
 
-            for blob in blobs:
-                if not blob.genet in lines:
-                    lines[blob.genet] = { }
-        data = []
-        #compact and sort lines.
-        count = 0
-        for g in sorted(lines.keys()):
-            lines[g]['row'] = count
-            count += 1
-            row = [""] * len(fields)
-            row[0] = g
-            data.append(row)
+        # the regions of a colony together, in the order of the maps
+        order_of = {img.name: k for k, img in enumerate(self.project.images)}
 
-        count = 1
-        for i,img in enumerate(self.project.images):
-            scale_factor = img.pixelSize()
-            for blob in self.blobs[i]:
-                line = lines[blob.genet]
-                row = line['row']
-                area = round(blob.area * (scale_factor) * (scale_factor) / 100, 2)
-                data[row][count] += blob.class_name + "  "
-                data[row][count+1] += str(blob.id) + "  "
-                data[row][count+2] += str(area) + "  "
+        def colonyKey(name):
+            map_name, _, first_id = name.rpartition(":")
+            return (order_of.get(map_name, len(order_of)), int(first_id) if first_id.isdigit() else -1)
 
-            count += 3
+        lines.sort(key=lambda line: (colonyKey(line[0]), line[1], line[2][4]))
 
         import csv
 
         with open(filename, mode='w', newline='') as file:
             writer = csv.writer(file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
-            writer.writerow(fields)
-            for line in data:
-                writer.writerow(line)
+            writer.writerow(['colony', 'genet', 'map', 'date', 'id', 'class', 'area_cm2', 'surf_area_cm2'])
+            for line in lines:
+                writer.writerow(line[2])
 
 
     def exportSVG(self, filename):

@@ -118,6 +118,8 @@ class Watershed(Tool):
             # Undo the segmentation - remove all created blobs and restore scribbles
             for blob in self.last_segmented_blobs:
                 self.viewerplus.removeBlob(blob)
+            # their born/dead rows are removed from the comparison tables
+            self.viewerplus.project.syncCorrespondences(self.viewerplus.image, [], self.last_segmented_blobs)
             self.just_segmented = False
             self.last_segmented_blobs = []
             # Restore the scribbles from saved state
@@ -343,6 +345,9 @@ class Watershed(Tool):
                     else:
                         self.log.emit(f"[TOOL][WATERSHED] Exception during blob creation: {e}")
         
+        # the new regions get a born/dead row in the comparison tables (the region shrunk by subtract is updated)
+        self.viewerplus.project.syncCorrespondences(self.viewerplus.image, created_blobs, [])
+
         # Store the created blobs and set the state
         self.last_segmented_blobs = created_blobs
         self.just_segmented = True
