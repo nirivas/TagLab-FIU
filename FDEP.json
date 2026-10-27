@@ -1,0 +1,390 @@
+{
+  "Name": "FDEP",
+  "Description": "FDEP Species List 03/17/2026",
+  "Labels": [
+    {
+      "id": "Zooanthid",
+      "name": "Zooanthid",
+      "description": null,
+      "fill": [
+        121,
+        0,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Sand",
+      "name": "Sand",
+      "description": null,
+      "fill": [
+        194,
+        178,
+        128
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Hard Substrate",
+      "name": "Hard Substrate",
+      "description": null,
+      "fill": [
+        255,
+        255,
+        255
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Porites astreoides",
+      "name": "Porites astreoides",
+      "description": null,
+      "fill": [
+        255,
+        255,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Vase Sponge",
+      "name": "Vase Sponge",
+      "description": null,
+      "fill": [
+        170,
+        0,
+        127
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Branching Sponge",
+      "name": "Branching Sponge",
+      "description": null,
+      "fill": [
+        85,
+        170,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Sid spp",
+      "name": "Sid spp",
+      "description": null,
+      "fill": [
+        85,
+        85,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Macroalgae",
+      "name": "Macroalgae",
+      "description": null,
+      "fill": [
+        0,
+        85,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Soft coral",
+      "name": "Soft coral",
+      "description": null,
+      "fill": [
+        255,
+        85,
+        127
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Massive sponge",
+      "name": "Massive sponge",
+      "description": null,
+      "fill": [
+        85,
+        85,
+        255
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Tube Sponge",
+      "name": "Tube Sponge",
+      "description": null,
+      "fill": [
+        0,
+        255,
+        255
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Montastraea cavernosa",
+      "name": "Montastraea cavernosa",
+      "description": null,
+      "fill": [
+        255,
+        170,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Diploria labyrinthiformis",
+      "name": "Diploria labyrinthiformis",
+      "description": null,
+      "fill": [
+        170,
+        170,
+        255
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Erythripodium spp",
+      "name": "Erythripodium spp",
+      "description": null,
+      "fill": [
+        255,
+        0,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Xestospongia muta",
+      "name": "Xestospongia muta",
+      "description": null,
+      "fill": [
+        170,
+        0,
+        255
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "DSTO",
+      "name": "DSTO",
+      "description": null,
+      "fill": [
+        255,
+        255,
+        127
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Sandalgae",
+      "name": "Sandalgae",
+      "description": null,
+      "fill": [
+        85,
+        170,
+        127
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Rubble",
+      "name": "Rubble",
+      "description": null,
+      "fill": [
+        136,
+        136,
+        136
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Markers",
+      "name": "Markers",
+      "description": null,
+      "fill": [
+        255,
+        85,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Orbicella faveolata",
+      "name": "Orbicella faveolata",
+      "description": null,
+      "fill": [
+        0,
+        255,
+        0
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Sandinsponge",
+      "name": "Sandinsponge",
+      "description": null,
+      "fill": [
+        203,
+        255,
+        126
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "LiveOther",
+      "name": "LiveOther",
+      "description": null,
+      "fill": [
+        7,
+        40,
+        255
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "SBOU",
+      "name": "SBOU",
+      "description": null,
+      "fill": [
+        207,
+        230,
+        255
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    },
+    {
+      "id": "Maze coral",
+      "name": "Maze coral",
+      "description": null,
+      "fill": [
+        167,
+        255,
+        112
+      ],
+      "border": [
+        200,
+        200,
+        200
+      ],
+      "visible": true
+    }
+  ]
+}
