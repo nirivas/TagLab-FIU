@@ -30,6 +30,18 @@ under the same GPL-3 licence. It changes the following.
 - **DEM > Calculate DEM Metrics** computes, for each colony: mean slope, elevation (mean/min/max), relief, height and
   volume above the surrounding substrate, and rugosity. The values are saved as region attributes and appear in the
   CSV and shapefile exports.
+- **Plot rugosity:** with no region selected, Calculate DEM Metrics also computes values for the whole plot. The plot
+  is the working area, or the whole map when there is none; only the part covered by the DEM counts.
+  - `rugosity` (3D surface area / planar area) and `slope_deg` at the DEM's own resolution.
+  - `rugosity_1cm` and `slope_1cm` on the DEM averaged to 1 cm cells. Use these to compare years or surveys whose
+    DEMs have different resolutions: a finer DEM always gives a higher rugosity.
+  - `relief_cm`: the height range of the plot after removing its overall tilt (1st to 99th percentile, so single
+    spikes don't count).
+  - Very steep slopes (walls of colonies and boulders) are counted, as in the usual surface-area ratio.
+  - The values are shown at the end, saved with the map, and exported by the new **DEM > Export Plot Metrics
+    (CSV)**: one row per map, with the area used, the DEM coverage and the DEM pixel size.
+  - With regions selected, only those colonies are updated.
+  - Speed: a 12000 × 12000 pixel DEM takes about 20 s on a laptop CPU.
 
 ## AI training and classification
 - **Training dataset export:** the "Biologically-inspired" split works (it crashed before). It picks the validation

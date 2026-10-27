@@ -75,7 +75,9 @@ class Image(object):
         self.export_dataset_area = export_dataset_area  # this is the region exported for training
         self.acquisition_date = acquisition_date  # acquisition date is mandatory (format YYYY-MM-DD)
         self.georef_filename = georef_filename  # image file (GeoTiff) contained the georeferencing information
-        self.metadata = metadata  # this follows image_metadata_template, do we want to allow freedom to add custome values?
+        # this follows image_metadata_template, do we want to allow freedom to add custome values?
+        # (a copy: the default {} would otherwise be shared by all the maps created without metadata)
+        self.metadata = dict(metadata) if metadata else {}
 
         self.sampling_areas = list()
         if sampling_areas:

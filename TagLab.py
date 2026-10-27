@@ -1398,8 +1398,12 @@ class TagLab(QMainWindow):
         calculateSurfaceAreaAct.triggered.connect(self.calculateAreaUsingSlope)
 
         calculateDemMetricsAct = QAction("Calculate DEM Metrics", self)
-        calculateDemMetricsAct.setStatusTip("Compute slope, elevation, relief, height, volume and rugosity of the selected regions (all the regions if none is selected)")
+        calculateDemMetricsAct.setStatusTip("Compute slope, elevation, relief, height, volume and rugosity of the selected regions (all the regions and the whole plot if none is selected)")
         calculateDemMetricsAct.triggered.connect(self.calculateDemMetrics)
+
+        exportPlotMetricsAct = QAction("Export Plot Metrics (CSV)", self)
+        exportPlotMetricsAct.setStatusTip("Export the plot rugosity, slope and relief computed by Calculate DEM Metrics, one row per map")
+        exportPlotMetricsAct.triggered.connect(self.exportPlotMetrics)
 
         exportClippedRasterAct = QAction("Export Clipped Raster", self)
         exportClippedRasterAct.setStatusTip("Export a raster clipped using visible annotations")
@@ -1414,6 +1418,7 @@ class TagLab(QMainWindow):
         self.demmenu.addAction(switchAct)
         self.demmenu.addAction(calculateSurfaceAreaAct)
         self.demmenu.addAction(calculateDemMetricsAct)
+        self.demmenu.addAction(exportPlotMetricsAct)
         self.demmenu.addAction(exportClippedRasterAct)
 
 
@@ -1606,7 +1611,8 @@ class TagLab(QMainWindow):
                 name=name,
                 acquisition_date=img.acquisition_date,
                 georef_filename=img.georef_filename,
-                metadata=img.metadata,
+                # the plot values (DEM metrics) refer to an area of the original map
+                metadata={k: v for k, v in img.metadata.items() if k != DemMetrics.PLOT_METRICS_KEY},
                 layers=img.layers,
                 grid=img.grid,
                 export_dataset_area=img.export_dataset_area
@@ -6056,26 +6062,26 @@ class TagLab(QMainWindow):
     def calculateDemMetrics(self):
         """
         Compute the DEM metrics (stored as region attributes) of the selected regions, or of all the regions
-        of the active map if no region is selected.
+        of the active map if no region is selected. In the latter case the values of the whole plot (the working
+        area, or the whole map) are computed too, and stored with the map (DemMetrics.computePlotMetrics).
         """
 
         if self.activeviewer is None or self.activeviewer.image is None:
             return
 
-        dem_channel = self.activeviewer.image.getDEMChannel()
+        image = self.activeviewer.image
+        dem_channel = image.getDEMChannel()
         if dem_channel is None:
             box = QMessageBox()
             box.setText("DEM not found! You need a DEM to compute the DEM metrics.")
             box.exec()
             return
 
-        if len(self.activeviewer.selected_blobs) > 0:
-            blobs = list(self.activeviewer.selected_blobs)
-        else:
+        whole_plot = len(self.activeviewer.selected_blobs) == 0
+        if whole_plot:
             blobs = list(self.activeviewer.annotations.seg_blobs)
-
-        if len(blobs) == 0:
-            return
+        else:
+            blobs = list(self.activeviewer.selected_blobs)
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self.setupProgressBar()
@@ -6087,32 +6093,127 @@ class TagLab(QMainWindow):
             self.progress_bar.setProgress(perc)
             QApplication.processEvents()
 
+        summary = None
+        plot = None
         try:
             dem_filename = os.path.join(self.taglab_dir, dem_channel.filename)
-            summary = DemMetrics.computeDemMetrics(dem_filename, blobs, self.activeviewer.image.pixelSize(), progress)
+            if len(blobs) > 0:
+                summary = DemMetrics.computeDemMetrics(dem_filename, blobs, image.pixelSize(), progress)
+                warning = summary["warning"]
+            else:
+                reader = DemMetrics.DemReader(dem_filename, image.pixelSize())
+                warning = DemMetrics.pixelSizeWarning(reader, image.pixelSize())
+                reader.close()
+
+            if whole_plot:
+                self.progress_bar.setMessage("Computing plot rugosity.. ")
+                self.progress_bar.setProgress(0.0)
+                QApplication.processEvents()
+                area, area_source = DemMetrics.plotArea(self.project.working_area, image.width, image.height)
+                plot = DemMetrics.computePlotMetrics(dem_filename, area, image.pixelSize(), progress)
+                plot["area_source"] = area_source
+                image.metadata[DemMetrics.PLOT_METRICS_KEY] = plot
         finally:
             self.deleteProgressBar()
             QApplication.restoreOverrideCursor()
 
-        DemMetrics.registerAttributes(self.project)
-        self.groupbox_blobpanel.updateRegionAttributes(self.project.region_attributes)
-        if self.blob_with_info_displayed is not None:
-            self.updatePanelInfo(self.blob_with_info_displayed)
+        txt = ""
+        if summary is not None:
+            DemMetrics.registerAttributes(self.project)
+            self.groupbox_blobpanel.updateRegionAttributes(self.project.region_attributes)
+            if self.blob_with_info_displayed is not None:
+                self.updatePanelInfo(self.blob_with_info_displayed)
 
-        current_area_mode = self.compare_panel.comboboxAreaMode.currentText()
-        self.updateAreaMode(current_area_mode.lower())
+            current_area_mode = self.compare_panel.comboboxAreaMode.currentText()
+            self.updateAreaMode(current_area_mode.lower())
 
-        logfile.info("[DEM] DEM metrics computed for {:d} regions ({:d} skipped).".format(summary["processed"], summary["skipped"]))
+            logfile.info("[DEM] DEM metrics computed for {:d} regions ({:d} skipped).".format(summary["processed"], summary["skipped"]))
 
-        txt = "DEM metrics computed for {:d} regions.".format(summary["processed"])
-        if summary["skipped"] > 0:
-            txt += "\n{:d} regions were skipped: the DEM does not cover enough of them.".format(summary["skipped"])
-        if summary["warning"] is not None:
-            txt += "\n\nWARNING: " + summary["warning"]
-        txt += "\n\nThe values are stored as region attributes (slope_deg, elev_*, relief_cm, height_cm, volume_cm3, " \
-               "rugosity) and they are exported in the data table and in the shapefile."
+            txt = "DEM metrics computed for {:d} regions.".format(summary["processed"])
+            if summary["skipped"] > 0:
+                txt += "\n{:d} regions were skipped: the DEM does not cover enough of them.".format(summary["skipped"])
+            txt += "\nThe values are stored as region attributes (slope_deg, elev_*, relief_cm, height_cm, volume_cm3, " \
+                   "rugosity) and they are exported in the data table and in the shapefile.\n\n"
+
+        if plot is not None:
+            logfile.info("[DEM] Plot metrics of the map '{:s}' ({:s}): {:s}".format(image.name, plot["area_source"],
+                         str({k: v for k, v in plot.items() if k != "area_source"})))
+            txt += self.plotMetricsText(plot)
+        else:
+            txt += "Only the selected regions were updated: the values of the whole plot are computed when no " \
+                   "region is selected."
+
+        if warning is not None:
+            txt += "\n\nWARNING: " + warning
         box = QMessageBox()
         box.setWindowTitle(self.TAGLAB_VERSION)
+        box.setText(txt)
+        box.exec()
+
+    def plotMetricsText(self, plot):
+        """
+        Description of the plot values computed by DemMetrics.computePlotMetrics, for the message.
+        """
+
+        if plot["rugosity"] is None:
+            return "Plot ({:s}): the DEM does not cover it, so its values could not be computed.".format(plot["area_source"])
+
+        def value(v, fmt):
+            return "n/a" if v is None else fmt.format(v)
+
+        txt = "Plot ({:s}): {:.2f} m² covered by the DEM ({:.1f}% of it).\n".format(
+            plot["area_source"], plot["planar_m2"], 100.0 * plot["dem_coverage"])
+        txt += "Rugosity: {:s} at the DEM resolution ({:.3f} mm), {:s} on {:.1f} mm cells.\n".format(
+            value(plot["rugosity"], "{:.4f}"), plot["dem_mm"], value(plot["rugosity_1cm"], "{:.4f}"), plot["cell_mm"])
+        txt += "Mean slope: {:s}° at the DEM resolution, {:s}° on {:.1f} mm cells.\n".format(
+            value(plot["slope_deg"], "{:.1f}"), value(plot["slope_1cm"], "{:.1f}"), plot["cell_mm"])
+        txt += "Relief: {:s} cm (above the overall tilt of the plot, without single spikes).\n\n".format(
+            value(plot["relief_cm"], "{:.1f}"))
+        txt += "The plot values are saved with the map (save the project). DEM > Export Plot Metrics (CSV) exports " \
+               "them for all the maps."
+        return txt
+
+    @pyqtSlot()
+    def exportPlotMetrics(self):
+        """
+        Export the plot values computed by Calculate DEM Metrics as CSV, one row per map.
+        """
+
+        if self.project is None or len(self.project.images) == 0:
+            return
+
+        computed = [img for img in self.project.images if DemMetrics.PLOT_METRICS_KEY in img.metadata]
+        missing = [img.name for img in self.project.images if DemMetrics.PLOT_METRICS_KEY not in img.metadata]
+
+        box = QMessageBox(self)
+        box.setWindowTitle(self.TAGLAB_VERSION)
+        if len(computed) == 0:
+            box.setText("No plot values yet: run DEM > Calculate DEM Metrics, with no region selected, on each map.")
+            box.exec()
+            return
+
+        filters = "CSV (*.csv)"
+        filename, _ = QFileDialog.getSaveFileName(self, "Export plot metrics",
+                                                  os.path.join(self.taglab_dir, "plot_metrics.csv"), filters)
+        if not filename:
+            return
+
+        DemMetrics.exportPlotMetrics(filename, computed)
+
+        # values computed on another area than the current plot (e.g. the working area changed since)
+        changed = []
+        for img in computed:
+            area, _ = DemMetrics.plotArea(self.project.working_area, img.width, img.height)
+            if list(img.metadata[DemMetrics.PLOT_METRICS_KEY]["area"]) != area:
+                changed.append(img.name)
+
+        txt = "Plot metrics of {:d} maps exported.".format(len(computed))
+        if len(missing) > 0:
+            txt += "\n\nMaps without plot values: " + ", ".join(missing) + \
+                   ".\nRun DEM > Calculate DEM Metrics on them, with no region selected."
+        if len(changed) > 0:
+            txt += "\n\nThese maps were computed on another area than the current working area: " + \
+                   ", ".join(changed) + ".\nRun DEM > Calculate DEM Metrics on them again."
         box.setText(txt)
         box.exec()
 

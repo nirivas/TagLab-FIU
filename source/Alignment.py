@@ -18,7 +18,7 @@ from rasterio.enums import Resampling
 from rasterio.transform import Affine
 
 from source.Point import Point
-from source.DemMetrics import DEM_METRIC_NAMES
+from source.DemMetrics import DEM_METRIC_NAMES, PLOT_METRICS_KEY
 
 DEM_DEFAULT_NODATA = -32767.0
 
@@ -386,10 +386,13 @@ def createTransformedImage(image, suffix, M, width, height, crs, transform, px_s
 
     from source.Image import Image
 
+    # the plot values (DEM metrics) refer to an area of the original map
+    metadata = {key: value for key, value in (image.metadata or {}).items() if key != PLOT_METRICS_KEY}
+
     new_image = Image(rect=[0.0, 0.0, 0.0, 0.0], map_px_to_mm_factor=str(px_size), width=None, height=None,
                       channels=[], id=image.id + suffix, name=image.name + suffix,
                       acquisition_date=image.acquisition_date, georef_filename="", workspace=[],
-                      metadata=dict(image.metadata) if image.metadata else {}, annotations={}, layers=[], grid={},
+                      metadata=metadata, annotations={}, layers=[], grid={},
                       export_dataset_area=[], sampling_areas=[])
 
     n = len(image.channels)

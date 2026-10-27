@@ -3,8 +3,10 @@
 #
 # Per-region metrics computed from the DEM channel (slope, elevation, relief, height, volume, rugosity).
 # Each region is processed on a small window of the DEM around its bounding box, so the whole DEM
-# is never loaded or processed at once.
+# is never loaded or processed at once. The values of the whole plot (rugosity, slope, relief) are
+# computed tile by tile (computePlotMetrics).
 
+import csv
 import numpy as np
 import rasterio as rio
 from rasterio.windows import Window
@@ -18,11 +20,18 @@ MIN_VALID_FRACTION = 0.5    # minimum fraction of the region covered by valid DE
 PAD = 3                     # pixels read around the bounding box (slope kernel + base plane ring)
 RING_SIZE = 2               # width (in pixels) of the ring used to fit the base plane
 
+# values of the whole plot (computePlotMetrics), stored in image.metadata[PLOT_METRICS_KEY]
+PLOT_METRICS_KEY = "plot_dem_metrics"
+PLOT_CELL_MM = 10.0        # cell of the averaged DEM giving values comparable between surveys (whole DEM pixels)
+PLOT_TILE = 2048            # the plot is processed in tiles of about this size (pixels)
+PLOT_MAX_CELLS = 16000000   # larger cells are used if the averaged DEM would have more cells than this
+PLOT_RELIEF_PERCENTILES = (1.0, 99.0)   # the relief is the range of heights between these percentiles
 
-def hornSlope(z, dx, dy):
+
+def hornGradient(z, dx, dy):
     """
-    Slope (in degrees) of the interior pixels of z computed with Horn's method (the same used by gdaldem).
-    The result has shape (h-2, w-2) and it is NaN where one of the 3x3 neighbors is missing.
+    Gradient (dz/dx, dz/dy) of the interior pixels of z computed with Horn's method (the same used by gdaldem).
+    The results have shape (h-2, w-2) and they are NaN where one of the 3x3 neighbors is missing.
     """
 
     a = z[:-2, :-2]
@@ -36,6 +45,17 @@ def hornSlope(z, dx, dy):
 
     dzdx = ((c + 2.0 * f + i) - (a + 2.0 * d + g)) / (8.0 * dx)
     dzdy = ((g + 2.0 * h + i) - (a + 2.0 * b + c)) / (8.0 * dy)
+
+    return dzdx, dzdy
+
+
+def hornSlope(z, dx, dy):
+    """
+    Slope (in degrees) of the interior pixels of z computed with Horn's method (the same used by gdaldem).
+    The result has shape (h-2, w-2) and it is NaN where one of the 3x3 neighbors is missing.
+    """
+
+    dzdx, dzdy = hornGradient(z, dx, dy)
 
     return np.degrees(np.arctan(np.sqrt(dzdx * dzdx + dzdy * dzdy)))
 
@@ -217,6 +237,183 @@ def computeSurfaceArea(dem_filename, blobs, pixel_size_mm=None):
             blob.surface_area = surface_area
     finally:
         reader.close()
+
+
+def surfaceSums(z, dx, dy):
+    """
+    Sums over the interior pixels of z (z has a border of one pixel around them) used for the plot values:
+    [pixels with a DEM value, valid slopes, sum of their surface factors 1/cos(slope), sum of the slopes (degrees)].
+    Unlike for the regions, steep slopes are kept (walls of colonies and boulders are real surface: excluding
+    the slopes above MAX_SLOPE made the rugosity of a steep sample plot 1.68 instead of 2.54), and the pixels
+    without a slope (next to a DEM hole) are left out instead of counting as flat: the rugosity of the plot is
+    the mean factor of the pixels with a slope.
+    """
+
+    dzdx, dzdy = hornGradient(z, dx, dy)
+    g2 = dzdx * dzdx + dzdy * dzdy
+
+    valid = np.isfinite(z[1:-1, 1:-1])
+    slope_ok = valid & np.isfinite(g2)
+    g2 = g2[slope_ok]
+
+    n_valid = float(valid.sum())
+    n_slope = float(len(g2))
+    factor_sum = float(np.sqrt(1.0 + g2).sum())
+    slope_sum = float(np.degrees(np.arctan(np.sqrt(g2))).sum())
+
+    return np.array([n_valid, n_slope, factor_sum, slope_sum])
+
+
+def computePlotMetrics(dem_filename, area, pixel_size_mm, progress=None, tile=PLOT_TILE):
+    """
+    Values of the whole plot area = [top, left, width, height] (pixels; it is clipped to the DEM): the rugosity
+    (3D surface area / planar area) and the mean slope, at the resolution of the DEM and on the DEM averaged to
+    cells of about PLOT_CELL_MM (comparable between surveys with different resolutions), and the relief: the
+    range of heights above the plane fitted to the averaged DEM (PLOT_RELIEF_PERCENTILES, so that single spikes
+    do not count). Only the part of the plot covered by the DEM is used.
+    The DEM is read once, in tiles of whole cells: each tile gives the sums at the DEM resolution (surfaceSums)
+    of its pixels inside the plot, and its cells. The cells form a grid with a border of one cell around the plot,
+    so that the slopes at its edges use the DEM around it, as at the DEM resolution.
+    progress, if given, is called with the percentage of the DEM processed.
+    """
+
+    reader = DemReader(dem_filename, pixel_size_mm)
+
+    try:
+        top = max(int(area[0]), 0)
+        left = max(int(area[1]), 0)
+        bottom = min(int(area[0]) + int(area[3]), reader.dataset.height)
+        right = min(int(area[1]) + int(area[2]), reader.dataset.width)
+        height = max(bottom - top, 0)
+        width = max(right - left, 0)
+
+        spacing_mm = 500.0 * (reader.dx + reader.dy)
+        f = max(1, int(round(PLOT_CELL_MM / spacing_mm)))
+        f = max(f, int(np.ceil(np.sqrt(float(width) * height / PLOT_MAX_CELLS))))
+
+        result = {"area": [top, left, width, height], "planar_m2": None, "dem_coverage": 0.0,
+                  "dem_mm": round(spacing_mm, 4), "rugosity": None, "slope_deg": None,
+                  "cell_mm": round(f * spacing_mm, 4), "rugosity_1cm": None, "slope_1cm": None, "relief_cm": None}
+        if width == 0 or height == 0:
+            return result
+
+        # grid of cells: whole cells inside the plot plus a border of one cell
+        nbr = height // f
+        nbc = width // f
+        grid_top = top - f
+        grid_left = left - f
+        cells = np.full((nbr + 2, nbc + 2), np.nan)
+
+        native = np.zeros(4)
+        kb = max(1, tile // f)  # cells per tile side
+        n_tiles = ((nbr + 1) // kb + 1) * ((nbc + 1) // kb + 1)
+        done = 0
+        for bi0 in range(0, nbr + 2, kb):
+            bi1 = min(bi0 + kb, nbr + 2)
+            for bj0 in range(0, nbc + 2, kb):
+                bj1 = min(bj0 + kb, nbc + 2)
+
+                r0 = grid_top + bi0 * f
+                c0 = grid_left + bj0 * f
+                th = (bi1 - bi0) * f
+                tw = (bj1 - bj0) * f
+                z = reader.readWindow(r0 - 1, c0 - 1, th + 2, tw + 2)   # one more pixel for the slopes
+
+                # pixels of the tile inside the plot, with their border
+                rr0 = max(r0, top)
+                rr1 = min(r0 + th, bottom)
+                cc0 = max(c0, left)
+                cc1 = min(c0 + tw, right)
+                if rr1 > rr0 and cc1 > cc0:
+                    native += surfaceSums(z[rr0 - r0:rr1 - r0 + 2, cc0 - c0:cc1 - c0 + 2], reader.dx, reader.dy)
+
+                # cells: mean of the valid DEM values, if they cover at least half of the cell
+                block = z[1:-1, 1:-1].reshape(bi1 - bi0, f, bj1 - bj0, f)
+                valid = np.isfinite(block)
+                count = valid.sum(axis=(1, 3))
+                total = np.where(valid, block, 0.0).sum(axis=(1, 3))
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    cells[bi0:bi1, bj0:bj1] = np.where(count >= 0.5 * f * f, total / count, np.nan)
+
+                done += 1
+                if progress is not None:
+                    progress(min(100.0, 100.0 * done / n_tiles))
+
+        n_valid, n_slope, factor_sum, slope_sum = native.tolist()
+        if n_valid == 0:
+            return result
+
+        result["planar_m2"] = round(n_valid * pixel_size_mm * pixel_size_mm / 1.0e6, 4)
+        result["dem_coverage"] = round(n_valid / (float(width) * height), 4)
+        if n_slope > 0:
+            result["rugosity"] = round(factor_sum / n_slope, 4)
+            result["slope_deg"] = round(slope_sum / n_slope, 2)
+
+        if nbr > 0 and nbc > 0:
+            coarse = np.zeros(4)
+            for r in range(0, nbr, tile):
+                for c in range(0, nbc, tile):
+                    coarse += surfaceSums(cells[r:min(r + tile, nbr) + 2, c:min(c + tile, nbc) + 2],
+                                          f * reader.dx, f * reader.dy)
+            coarse = coarse.tolist()
+            if coarse[1] > 0:
+                result["rugosity_1cm"] = round(coarse[2] / coarse[1], 4)
+                result["slope_1cm"] = round(coarse[3] / coarse[1], 2)
+
+            # relief: heights above the least-squares plane of the cells inside the plot
+            inner = cells[1:-1, 1:-1]
+            rows, cols = np.nonzero(np.isfinite(inner))
+            if len(rows) >= 3:
+                x = cols * (f * reader.dx)
+                y = rows * (f * reader.dy)
+                zs = inner[rows, cols]
+                A = np.column_stack((x, y, np.ones(len(rows))))
+                coeffs = np.linalg.lstsq(A, zs, rcond=None)[0]
+                heights = zs - A @ coeffs
+                low, high = np.percentile(heights, PLOT_RELIEF_PERCENTILES)
+                result["relief_cm"] = round(float(high - low) * 100.0, 2)
+
+        return result
+
+    finally:
+        reader.close()
+
+
+def plotArea(working_area, width, height):
+    """
+    The plot of a map of the given size: the working area [top, left, width, height] clipped to the map or, if
+    there is none, the whole map. It returns (area, "working area" or "whole map").
+    """
+
+    if working_area is None or len(working_area) != 4:
+        return [0, 0, int(width), int(height)], "whole map"
+
+    top = max(int(working_area[0]), 0)
+    left = max(int(working_area[1]), 0)
+    bottom = min(int(working_area[0]) + int(working_area[3]), int(height))
+    right = min(int(working_area[1]) + int(working_area[2]), int(width))
+
+    return [top, left, max(right - left, 0), max(bottom - top, 0)], "working area"
+
+
+PLOT_CSV_COLUMNS = ["map", "date", "area", "top", "left", "width", "height", "planar_m2", "dem_coverage", "dem_mm",
+                    "rugosity", "slope_deg", "cell_mm", "rugosity_1cm", "slope_1cm", "relief_cm"]
+
+
+def exportPlotMetrics(filename, images):
+    """
+    Write the plot values of the given maps (image.metadata[PLOT_METRICS_KEY]) as CSV: one row per map.
+    """
+
+    with open(filename, "w", newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(PLOT_CSV_COLUMNS)
+        for image in images:
+            plot = image.metadata[PLOT_METRICS_KEY]
+            top, left, width, height = plot["area"]
+            row = [image.name, image.acquisition_date, plot.get("area_source"), top, left, width, height]
+            row += [plot.get(name) for name in PLOT_CSV_COLUMNS[7:]]
+            writer.writerow(["" if value is None else value for value in row])
 
 
 def registerAttributes(project):
