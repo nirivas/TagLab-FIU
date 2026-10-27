@@ -31,6 +31,7 @@ import urllib
 import platform
 import pandas as pd
 import importlib
+from collections import Counter
 
 from PyQt5.QtCore import Qt, QSize, QMargins, QDir, QPoint, QPointF, QRectF, QTimer, pyqtSlot, pyqtSignal, QSettings, QFileInfo, QModelIndex, \
     QObject, QThread, QEventLoop
@@ -63,6 +64,7 @@ import csv
 import source.Mask as Mask
 import source.RasterOps as rasterops
 from source import DemMetrics
+from source import PointsFromRegions
 from source import CarryOver
 from source.QtCarryOverWidget import QtCarryOverWidget
 from source.QtCarryOverReview import QtCarryOverReview
@@ -82,6 +84,7 @@ from source.QtHistogramWidget import QtHistogramWidget
 from source.QtClassifierWidget import QtClassifierWidget
 from source.QtNewDatasetWidget import QtNewDatasetWidget
 from source.QtSampleWidget import QtSampleWidget
+from source.QtPointsFromRegionsWidget import QtPointsFromRegionsWidget
 from source.QtGeoreferencingWidget import QtGeoreferencingWidget
 from source.QtTrainingResultsWidget import QtTrainingResultsWidget
 from source.QtTYNWidget import QtTYNWidget
@@ -267,6 +270,7 @@ class TagLab(QMainWindow):
         self.align_tool_widget = None
         self.edit_project_widget = None
         self.sample_point_widget = None
+        self.points_from_regions_widget = None
         self.georeferencing_tool_widget = None
         self.scale_widget = None
         self.dictionary_widget = None
@@ -1355,6 +1359,10 @@ class TagLab(QMainWindow):
         samplePointsAct.setStatusTip("Sample Points This Map")
         samplePointsAct.triggered.connect(self.chooseSampling)
 
+        labelPointsFromRegionsAct = QAction("Label Points from Regions...", self)
+        labelPointsFromRegionsAct.setStatusTip("Give the points the class of the region under them, and add points inside the regions (e.g. CoralNet training data)")
+        labelPointsFromRegionsAct.triggered.connect(self.openPointsFromRegions)
+
         self.importViscorePointsAct = QAction("Import Viscore Point Annotations", self)
         self.importViscorePointsAct.setStatusTip("Import Point Annotations From .CSV")
         self.importViscorePointsAct.triggered.connect(self.importViscorePointAnn)
@@ -1382,6 +1390,7 @@ class TagLab(QMainWindow):
         self.pointmenu = menubar.addMenu("&Points")
         self.pointmenu.setStyleSheet(styleMenu)
         self.pointmenu.addAction(samplePointsAct)
+        self.pointmenu.addAction(labelPointsFromRegionsAct)
         self.pointmenu.addSeparator()
         self.pointmenu.addAction(self.importViscorePointsAct)
         self.pointmenu.addAction(self.importCoralNetPointsAct)
@@ -4334,6 +4343,142 @@ class TagLab(QMainWindow):
         self.activeviewer.drawAllPointsAnn()
         self.activeviewer.drawSamplingAreas()
         self.closeSamplingWidget()
+
+    @pyqtSlot()
+    def openPointsFromRegions(self):
+        """
+        Opens the window of Points > Label Points from Regions (see labelPointsFromRegions).
+        """
+
+        if self.activeviewer is None or self.activeviewer.image is None:
+            return
+
+        if self.points_from_regions_widget is None:
+            self.points_from_regions_widget = QtPointsFromRegionsWidget(self.project, self.project.working_area, parent=self)
+            self.points_from_regions_widget.setWindowModality(Qt.NonModal)
+            self.points_from_regions_widget.btnApply.clicked.connect(self.labelPointsFromRegions)
+            self.points_from_regions_widget.closewidget.connect(self.closePointsFromRegions)
+        self.points_from_regions_widget.show()
+        self.points_from_regions_widget.raise_()
+
+    @pyqtSlot()
+    def closePointsFromRegions(self):
+
+        widget = self.points_from_regions_widget
+        self.points_from_regions_widget = None
+        if widget is not None:
+            widget.close()
+
+    @pyqtSlot()
+    def labelPointsFromRegions(self):
+        """
+        The points of the active map (inside the working area, if one is set) get the class of the region under
+        them, and points are added inside the regions (source/PointsFromRegions.py). What will change is shown
+        first. Like the other point operations, it cannot be undone.
+        """
+
+        widget = self.points_from_regions_widget
+        if widget is None or self.activeviewer is None or self.activeviewer.image is None:
+            return
+
+        options = widget.options()
+        if not options["label"] and not options["add"]:
+            box = QMessageBox(self)
+            box.setWindowTitle("Label Points from Regions")
+            box.setText("Nothing to do: tick at least one of the two options.")
+            box.exec()
+            return
+
+        image = self.activeviewer.image
+        annotations = self.activeviewer.annotations
+        area = None
+        area_txt = "the whole map"
+        if self.project.working_area is not None:
+            area, _ = DemMetrics.plotArea(self.project.working_area, image.width, image.height)
+            area_txt = "the working area"
+        edge_px = PointsFromRegions.edgePixels(options["edge_mm"], image.pixelSize())
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            lookup = PointsFromRegions.RegionLookup(annotations.seg_blobs, edge_px, options["outside_class"],
+                                                    (image.width, image.height))
+            points = [p for p in annotations.annpoints if PointsFromRegions.insideArea(p.coordx, p.coordy, area)]
+
+            changes, final, counts = [], {}, Counter()
+            if options["label"]:
+                changes, final, counts = PointsFromRegions.labelPoints(points, lookup, options["only_empty"])
+
+            added = []
+            if options["add"]:
+                existing = [(p.coordx, p.coordy, final.get(p, p.class_name)) for p in points]
+                added = PointsFromRegions.addRegionPoints(lookup, existing, options["per_class"], area)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # what will change
+        after = Counter(final.get(p, p.class_name) for p in points)
+        after.update(name for (_, _, name) in added)
+        empty_after = after.pop(PointsFromRegions.EMPTY, 0)
+
+        txt = "Map '{:s}', {:s}. Edge distance: {:.1f} mm ({:d} px).\n\n".format(image.name, area_txt,
+                                                                             options["edge_mm"], edge_px)
+        if options["label"]:
+            considered = len(final)
+            txt += "Points on the map{:s}: {:d}.\n".format(" still Empty" if options["only_empty"] else "", considered)
+            txt += "  - {:d} get a class ({:d} change class).\n".format(
+                considered - counts["near edge"] - counts["no region"], len(changes))
+            txt += "  - {:d} stay Empty: closer than the edge distance to another class or to an area without " \
+                   "regions.\n".format(counts["near edge"])
+            if lookup.outside_class is None:
+                txt += "  - {:d} stay Empty: on no region.\n".format(counts["no region"])
+        if options["add"]:
+            txt += "Points added inside the regions: {:d}.\n".format(len(added))
+        txt += "\nPoints with a class after this (exported for CoralNet):\n"
+        if len(after) == 0:
+            txt += "  none\n"
+        for name in sorted(after):
+            txt += "  {:s}: {:d}\n".format(name, after[name])
+        txt += "Points left Empty (not exported): {:d}.\n".format(empty_after)
+
+        if len(changes) == 0 and len(added) == 0:
+            box = QMessageBox(self)
+            box.setWindowTitle("Label Points from Regions")
+            box.setText(txt + "\nNothing changes.")
+            box.exec()
+            return
+
+        txt += "\nThis cannot be undone with Ctrl+Z. Apply?"
+        reply = QMessageBox.question(self, "Label Points from Regions", txt, QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        # apply: the panels are rebuilt once at the end instead of point by point, and the new points (with unique
+        # ids) are appended directly, since Annotation.addPoint compares each id with all the points
+        for point, class_name in changes:
+            self.project.setPointClass(image, point, class_name, notify=False)
+        next_id = max([p.id for p in annotations.annpoints], default=-1) + 1
+        for (x, y, class_name) in added:
+            annotations.annpoints.append(Point(int(x), int(y), class_name, next_id))
+            next_id += 1
+
+        self.activeviewer.drawAllPointsAnn()
+        annotations.table_needs_update = True
+        self.data_panel.active_image = None
+        self.data_panel.setTable(image)
+        self.labels_widget.active_image = None
+        self.labels_widget.setLabels(self.project, image)
+
+        logfile.info("[POINTS] Label Points from Regions on '{:s}': {:d} points labelled, {:d} added, options {:s}".format(
+            image.name, len(changes), len(added), str(options)))
+
+        self.closePointsFromRegions()
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Label Points from Regions")
+        box.setText("{:d} points labelled and {:d} points added. Save the project to keep them.\n\n"
+                    "Points > Export Tiled Data for CoralNet exports them as CoralNet training data.".format(
+                        len(changes), len(added)))
+        box.exec()
 
     @pyqtSlot()
     def editProject(self):

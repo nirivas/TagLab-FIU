@@ -19,6 +19,7 @@
 
 import os
 import re
+import math
 import csv
 import sys
 from datetime import datetime
@@ -1262,7 +1263,7 @@ class Annotation(object):
 
             # If inside the box, add to subset
             if left <= x <= right and top <= y <= bottom:
-                point_data = point.data
+                point_data = point.data.copy()
                 # Update the attributes
                 point_data['Label'] = point.class_name
                 point_data['Row'] = y
@@ -1279,11 +1280,19 @@ class Annotation(object):
 
         return csv_file
 
-    def exportCoralNetData(self, output_dir, channel, annotations, working_area, tile_size=2048, max_size=8000):
+    def exportCoralNetData(self, output_dir, channel, annotations, working_area, tile_size=2048, max_size=8000,
+                           training=False, codes=None, always_tile=False):
         """
         The function exports a CoralNet formatted CSV file (Name, Row, Column, Label) for all points
         in the user-specified work area. Tiles are made, and point locations are based on the tile
         coordinates. See exportCoralNetCSVAnn for non-tiled points.
+        The area is split into ceil(width / tile_size) x ceil(height / tile_size) tiles (a single tile if it is
+        smaller than max_size both ways, unless always_tile), and each point goes to the one tile containing it.
+        Only the tiles with points are saved (JPEG, quality 95).
+        training: CoralNet training data. Only the points with a class (not Empty) are exported, and
+        coralnet_annotations.csv has exactly the columns Name, Row, Column, Label, where Label is codes[class]
+        (the class name if it is not in codes); label_codes.csv lists the classes, their code and number of points.
+        Otherwise exported_points.csv has the points' attributes too (used by the CoralNet Toolbox).
         """
 
         # Get the image basename
@@ -1291,18 +1300,9 @@ class Annotation(object):
         basename = os.path.basename(image_name).split('.')[0]
         img_width, img_height = channel.qimage.width(), channel.qimage.height()
 
-        # Create the output directory to be based on ortho name
-        now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_dir = os.path.join(output_dir, now)
-        tiles_dir = os.path.join(output_dir, "tiles")
-        os.makedirs(tiles_dir, exist_ok=True)
-
-        # Output CSV file
-        csv_file = os.path.join(output_dir, "exported_points.csv")
-
         # Selected working area
         if working_area:
-            top, left, width, height = working_area
+            top, left, width, height = [int(v) for v in working_area]
             bottom = top + height
             right = left + width
         else:
@@ -1319,76 +1319,95 @@ class Annotation(object):
         # Update width and height
         width = right - left
         height = bottom - top
+        if width <= 0 or height <= 0:
+            raise Exception("The working area is outside the map.")
+
+        # Tile grid: tiles of (at most) w_size x h_size, the last row and column cut at the area border
+        if always_tile or width >= max_size or height >= max_size:
+            nx = max(1, int(math.ceil(width / tile_size)))
+            ny = max(1, int(math.ceil(height / tile_size)))
+        else:
+            nx = ny = 1
+        w_size = int(math.ceil(width / nx))
+        h_size = int(math.ceil(height / ny))
+
+        # Create the output directory to be based on ortho name
+        now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        folder = os.path.join(output_dir, now)
+        suffix = 2
+        while os.path.exists(folder):
+            folder = os.path.join(output_dir, f"{now}_{suffix}")
+            suffix += 1
+        output_dir = folder
+        tiles_dir = os.path.join(output_dir, "tiles")
+        os.makedirs(tiles_dir, exist_ok=True)
+
+        # Output CSV file
+        csv_file = os.path.join(output_dir, "coralnet_annotations.csv" if training else "exported_points.csv")
 
         # To hold all the tiled point annotations
         points = []
 
-        # If it's an area smaller than max_size, no need to tile
-        if width < max_size and height < max_size:
+        # Loop through the tiles
+        for j in range(ny):
+            for i in range(nx):
+                # Calculate the offset and box for the tile
+                xoff = left + w_size * i
+                yoff = top + h_size * j
+                bbox = [yoff, xoff, min(w_size, right - xoff), min(h_size, bottom - yoff)]
+                if bbox[2] <= 0 or bbox[3] <= 0:
+                    continue
 
-            # Working area
-            xoff, yoff = left, top
-            bbox = [top, left, width, height]
+                # Naming convention
+                plot_idx = i + j * nx
+                tile_name = f"{basename}_tile{plot_idx:04d}_offx={xoff:05d}_offy={yoff:05d}.jpg"
+                tile_path = os.path.join(tiles_dir, tile_name)
 
-            # Cropping the tile from original ortho
-            img_tile = genutils.cropQImage(channel.qimage, bbox)
+                # Find all point annotations within the tile bounding box
+                ann_points_in_box = annotations.getAnnPointsWithinBox(tile_name, bbox, xoff, yoff, training, codes)
 
-            # Naming convention
-            plot_idx = 0
-            tile_name = f"{basename}_tile{plot_idx:04d}_offx={xoff:05d}_offy={yoff:05d}.jpg"
-            tile_path = os.path.join(tiles_dir, tile_name)
-
-            # Find all point annotations within the tile bounding box
-            ann_points_in_box = annotations.getAnnPointsWithinBox(tile_name, bbox, xoff, yoff)
-
-            # If there are point annotations, save the image and add to the dataframe
-            if ann_points_in_box:
-                img_tile.save(tile_path)
-                points = ann_points_in_box
-
-        else:
-            # The area is too big, so tile
-            w_step = int(width / tile_size)
-            h_step = int(height / tile_size)
-
-            w_size = int(width / w_step) + 1
-            h_size = int(height / h_step) + 1
-
-            # Loop through the tiles
-            for j in range(h_step):
-                for i in range(w_step):
-                    # Calculate the offset and box for the tile
-                    xoff = left + w_size * i
-                    yoff = top + h_size * j
-                    bbox = [yoff, xoff, w_size, h_size]
-
+                # If there are point annotations, save the tile and extend the points list
+                if ann_points_in_box:
                     # Cropping the tile from original ortho
                     img_tile = genutils.cropQImage(channel.qimage, bbox)
+                    img_tile.save(tile_path, "JPG", 95)
+                    points.extend(ann_points_in_box)
 
-                    # Naming convention
-                    plot_idx = i + j * w_step
-                    tile_name = f"{basename}_tile{plot_idx:04d}_offx={xoff:05d}_offy={yoff:05d}.jpg"
-                    tile_path = os.path.join(tiles_dir, tile_name)
+        if not points:
+            # no tile was saved: remove the empty folders
+            os.rmdir(tiles_dir)
+            os.rmdir(output_dir)
+            raise Exception("No points with a class found in the specified working area." if training else
+                            "No points found in the specified working area.")
 
-                    # Find all point annotations within the tile bounding box
-                    ann_points_in_box = annotations.getAnnPointsWithinBox(tile_name, bbox, xoff, yoff)
+        if training:
+            points = pd.DataFrame(points, columns=["Name", "Row", "Column", "Label"])
+            points.to_csv(csv_file, index=False)
 
-                    # If there are point annotations, save the tile and extend the points list
-                    if ann_points_in_box:
-                        img_tile.save(tile_path)
-                        points.extend(ann_points_in_box)
-
-        if points:
+            # the classes exported (the tiles cover the whole area), with their code and number of points
+            per_class = {}
+            for point in annotations.annpoints:
+                if point.class_name != "Empty" and left <= point.coordx < right and top <= point.coordy < bottom:
+                    per_class[point.class_name] = per_class.get(point.class_name, 0) + 1
+            with open(os.path.join(output_dir, "label_codes.csv"), "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["class", "code", "points"])
+                for class_name in sorted(per_class):
+                    code = codes.get(class_name, class_name) if codes else class_name
+                    writer.writerow([class_name, code, per_class[class_name]])
+        else:
             points = pd.DataFrame(points)
             points.to_csv(csv_file)
-        else:
-            raise Exception("No points found in the specified working area.")
 
         return output_dir, csv_file
 
-    def getAnnPointsWithinBox(self, tile_name, box, xoff, yoff):
+    def getAnnPointsWithinBox(self, tile_name, box, xoff, yoff, training=False, codes=None):
         """
         Simple function to get the point annotations within a work area for CoralNet.
+        The box [top, left, width, height] contains the points with left <= x < left + width and
+        top <= y < top + height, so that tiles side by side never share a point.
+        training: only the points with a class (not Empty), as {Name, Row, Column, Label}, with Row and Column
+        whole pixels of the tile and Label = codes[class] (or the class name).
         """
         # Get the dimensions of the box
         top = box[0]
@@ -1401,29 +1420,41 @@ class Annotation(object):
 
         for point in self.annpoints:
 
+            # Get the coordinates
+            x = point.coordx
+            y = point.coordy
+
+            # If inside the box, add to subset
+            if not (left <= x < right and top <= y < bottom):
+                continue
+
+            if training:
+                if point.class_name == "Empty":
+                    continue
+                label = codes.get(point.class_name, point.class_name) if codes else point.class_name
+                ann_points_in_box.append({'Name': tile_name,
+                                          'Row': int(math.floor(y)) - yoff,
+                                          'Column': int(math.floor(x)) - xoff,
+                                          'Label': label})
+                continue
+
             # Get all the information from point
             point_dict = point.toDict()
 
-            # Get the coordinates
-            x = point_dict['X']
-            y = point_dict['Y']
+            # Add the additional attributes
+            point_dict['Name'] = tile_name
+            point_dict['Label'] = point.class_name
+            # Tile space coordinates
+            point_dict['Row'] = y - yoff
+            point_dict['Column'] = x - xoff
 
-            # If inside the box, add to subset
-            if left <= x <= right and top <= y <= bottom:
-                # Add the additional attributes
-                point_dict['Name'] = tile_name
-                point_dict['Label'] = point.class_name
-                # Tile space coordinates
-                point_dict['Row'] = y - yoff
-                point_dict['Column'] = x - xoff
+            # Overwrite old point data with new data dict, remove 'Data' dict
+            point_data = point.data.copy()
+            point_data.update(point_dict)
+            del point_data['Data']
+            del point_data['Id']
 
-                # Overwrite old point data with new data dict, remove 'Data' dict
-                point_data = point.data.copy()
-                point_data.update(point_dict)
-                del point_data['Data']
-                del point_data['Id']
-
-                # Add dict to list
-                ann_points_in_box.append(point_data)
+            # Add dict to list
+            ann_points_in_box.append(point_data)
 
         return ann_points_in_box

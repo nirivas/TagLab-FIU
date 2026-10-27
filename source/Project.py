@@ -266,7 +266,7 @@ class Project(QObject):
         self.region_attributes = RegionAttributes(**region_attributes)
 
         self.spatial_reference_system = spatial_reference_system  # if None we assume coordinates in pixels (but Y is up or down?!)
-        self.metadata = metadata  # project metadata => keyword -> value
+        self.metadata = dict(metadata) if metadata else {}  # project metadata => keyword -> value (a copy: the default is shared)
         self.image_metadata_template = image_metadata_template  # description of metadata keywords expected in images
         # name: { type: (integer, date, string), mandatory: (true|false), default: ... }
 

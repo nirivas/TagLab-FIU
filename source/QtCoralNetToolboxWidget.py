@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QScrollArea, QHeader
 from PyQt5.QtWidgets import QSizePolicy, QLineEdit, QLabel, QPushButton, QHBoxLayout, QVBoxLayout
 
 from source.tools.CoralNetToolbox.API import submit_jobs
-from source.tools.CoralNetToolbox.Upload import upload_images
+from source.tools.CoralNetToolbox.Upload import upload_images, upload_annotations
 from source.tools.CoralNetToolbox.Common import IMG_FORMATS
 from source.tools.CoralNetToolbox.Browser import login, authenticate, check_for_browsers, get_token
 from source.tools.CoralNetToolbox.Download import download_coralnet_sources, download_labelset
@@ -293,11 +293,17 @@ class QtCoralNetToolboxWidget(QWidget):
         layoutButtons.setAlignment(Qt.AlignRight)
         layoutButtons.addStretch()
 
+        self.btnUploadTraining = QPushButton("Upload Training Data...")
+        self.btnUploadTraining.setToolTip("Upload tiles and point annotations made by Points > Export Tiled Data "
+                                          "for CoralNet to Source ID 1 (after authentication)")
+        self.btnUploadTraining.clicked.connect(self.uploadTrainingData)
+        self.btnUploadTraining.setEnabled(False)
         self.btnApply = QPushButton("Apply")
         self.btnApply.clicked.connect(self.apply)
         self.btnExit = QPushButton("Exit")
         self.btnExit.clicked.connect(self.close)
 
+        layoutButtons.addWidget(self.btnUploadTraining)
         layoutButtons.addWidget(self.btnApply)
         layoutButtons.addWidget(self.btnExit)
 
@@ -479,6 +485,7 @@ class QtCoralNetToolboxWidget(QWidget):
             self.editOutputFolder.setText(self.temp_folder)
             self.btnOutputFolder.clicked.connect(self.chooseOutputFolder)
             self.btnSetSources.clicked.connect(self.taglabLoadLabelsetPanel)
+            self.btnUploadTraining.setEnabled(True)
 
         except Exception as e:
             msgBox.setText(f"Could not complete authentication. {e}")
@@ -696,6 +703,85 @@ class QtCoralNetToolboxWidget(QWidget):
             msgBox.setText(f"{e}")
             msgBox.exec()
 
+    @pyqtSlot()
+    def uploadTrainingData(self):
+        """
+        Uploads training data made by Points > Export Tiled Data for CoralNet (a folder with tiles/ and
+        coralnet_annotations.csv) to Source ID 1: the tiles first, then the point annotations. The source must
+        already have a label set with the codes used in the CSV.
+        """
+        title = "Upload Training Data"
+        try:
+            source_id = int(self.editSourceID1.text())
+        except ValueError:
+            QMessageBox.warning(self, title, "Enter Source ID 1: the CoralNet source to upload the training data to.")
+            return
+
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder made by Export Tiled Data for CoralNet",
+                                                  self.temp_folder)
+        if not folder:
+            return
+
+        # check the folder: tiles + annotation CSV in CoralNet format, naming only these tiles
+        tiles_folder = os.path.join(folder, "tiles")
+        csv_file = os.path.join(folder, "coralnet_annotations.csv")
+        images = sorted(glob.glob(os.path.join(tiles_folder, "*.*")))
+        images = [os.path.abspath(i) for i in images if i.split('.')[-1].lower() in IMG_FORMATS]
+        if not os.path.exists(csv_file) or len(images) == 0:
+            QMessageBox.warning(self, title, "This folder has no tiles/ folder and coralnet_annotations.csv: choose "
+                                             "a folder made by Points > Export Tiled Data for CoralNet.")
+            return
+        try:
+            points = pd.read_csv(csv_file)
+        except Exception as e:
+            QMessageBox.warning(self, title, f"coralnet_annotations.csv could not be read. {e}")
+            return
+        if list(points.columns) != ["Name", "Row", "Column", "Label"] or len(points) == 0:
+            QMessageBox.warning(self, title, "coralnet_annotations.csv must have the columns Name, Row, Column, "
+                                             "Label and at least one point.")
+            return
+        missing = set(points["Name"]) - set(os.path.basename(i) for i in images)
+        if missing:
+            QMessageBox.warning(self, title, f"{len(missing)} images named in coralnet_annotations.csv are not in "
+                                             f"the tiles folder, e.g. {sorted(missing)[0]}.")
+            return
+
+        codes = sorted(set(str(code) for code in points["Label"]))
+        reply = QMessageBox.question(self, title,
+                                     f"Upload {len(images)} images and {len(points)} point annotations to CoralNet "
+                                     f"source {source_id}?\n\n"
+                                     f"The source's label set must already contain these codes:\n"
+                                     f"{', '.join(codes)}\n\n"
+                                     f"Images already in the source are not uploaded again, and point annotations "
+                                     f"already on these images are replaced.",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.console_widget.clearConsole()
+        try:
+            # upload_images returns only a flag on some errors
+            result = upload_images(self.driver, source_id, images, prefix="")
+            if not isinstance(result, tuple) or not result[1]:
+                raise Exception("The images could not be uploaded (see the messages in the console).")
+            self.driver = result[0]
+
+            self.driver, success = upload_annotations(self.driver, source_id, os.path.abspath(csv_file))
+            if not success:
+                raise Exception("The point annotations could not be uploaded (see the messages in the console). "
+                                "Check that the source's label set contains all the codes.")
+
+            text = (f"Uploaded {len(images)} images and {len(points)} point annotations to source {source_id}.\n\n"
+                    f"CoralNet trains the source's classifier automatically once it has enough annotated images.")
+        except Exception as e:
+            text = f"Upload failed. {e}"
+
+        QApplication.restoreOverrideCursor()
+        msgBox = QMessageBox()
+        msgBox.setText(text)
+        msgBox.exec()
+
     def taglabExport(self):
         """
         Exports the points and tiles from the user specified area in the output directory;
@@ -900,4 +986,5 @@ class QtCoralNetToolboxWidget(QWidget):
         self.driver = None
         self.console_widget.clearConsole()
         sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
         super().closeEvent(event)

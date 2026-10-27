@@ -175,6 +175,45 @@ Alignment Tool.
 - **Export Genet Data as CSV:** one row per colony per map, with the columns `colony, genet, map, date, id, class,
   area_cm2, surf_area_cm2`.
 
+## Points and CoralNet training data
+Your region annotations can now be used to train a CoralNet source. The steps are: Points > Sample Points On This Map
+(optional), then Points > Label Points from Regions, then Points > Export Tiled Data for CoralNet, then the upload (on
+the CoralNet website or with the CoralNet Toolbox).
+- **Points > Label Points from Regions…** works on the active map, inside the working area if one is set.
+  - **Labelling:** each point gets the class of the region under it.
+    - Where regions overlap, the smaller one wins (e.g. a sponge drawn on a sand region without a hole for it).
+    - "Only the points still Empty" is on by default, so classes given by hand or imported from CoralNet are kept.
+  - **New points:** one in every region that has no point, then more until every class has at least the number you
+    choose (default 20), spread over its regions by area.
+  - **Edge distance** (default 2 mm):
+    - A point closer than this to another class, or to an area without regions, stays Empty and is not exported,
+      because its label is uncertain. The map border does not count as an edge.
+    - New points keep this distance from edges, and twice this distance from other points.
+    - A region too small for that gets its point at its centre.
+  - **Points on no region:** they stay Empty, or you can give them a class (e.g. Sand, when the sand is not drawn as
+    regions).
+  - **Before anything changes** you see what will change. Like the other point operations, this can't be undone with
+    Ctrl+Z. Running it again with the same options gives the same points.
+- **Export Tiled Data for CoralNet** now exports training data:
+  - **Codes:** a table gives the CoralNet label code of each class (the short codes of your source's label set). The
+    codes are saved with the project and filled in the next time.
+  - **Tile size:** the size you enter is used (it was always 2048 before); the default is 2048 px.
+  - **Tiles:** each point is in exactly one tile (points on a tile border used to be exported twice). Only tiles with
+    points are saved, as JPEG at quality 95.
+  - **The export folder** contains:
+    - `tiles/`: the images
+    - `coralnet_annotations.csv`: the columns Name, Row, Column, Label, as CoralNet's annotation upload expects
+      (Empty points are left out)
+    - `label_codes.csv`: each class, its code and its number of points
+- **CoralNet Toolbox > Upload Training Data…** (after Authenticate):
+  - You choose an export folder, and it uploads the tiles, then the annotations, to Source ID 1.
+  - The source must already have a label set with your codes. Point annotations already on those images in the source
+    are replaced.
+  - Try it on a test source first.
+- **Fixes:**
+  - Export CoralNet Point Annotations no longer writes Label, Row, Column and Name into the points' saved data.
+  - Error messages printed after the CoralNet Toolbox was closed went to its closed window.
+
 ## Rotate Map (Project > Rotate Map…)
 - Creates a rotated copy of a map: 90°, 180° and 270° are exact, or you can enter any angle.
 - The DEM, the colonies, the points and the georeferencing are rotated too.
