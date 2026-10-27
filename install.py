@@ -1,6 +1,7 @@
 import platform
 import sys
 import os
+import re
 import subprocess
 from subprocess import STDOUT, check_call
 from pathlib import Path
@@ -21,16 +22,16 @@ if sys.version_info[0] < 3 or (sys.version_info[0] == 3 and (sys.version_info[1]
 
 torch_install_dict = None
 
+# the CUDA builds are pinned with their "+cuXXX" label: with a plain "torch==2.5", pip would keep a CPU build that is
+# already installed (for example from an earlier installation on a computer whose GPU was not detected)
 win_torch_install_dict = {
-    '11.6': ['torch==1.13.1+cu116', 'torchvision==0.14.1+cu116', '--extra-index-url' + 'https://download.pytorch.org/whl/cu116'],
-    '11.8': ['torch==2.5', 'torchvision==0.20', '--index-url', 'https://download.pytorch.org/whl/cu118'],
-    '12.1': ['torch==2.5', 'torchvision==0.20', '--index-url', 'https://download.pytorch.org/whl/cu121'],
-    '12.4': ['torch==2.5', 'torchvision==0.20', '--index-url', 'https://download.pytorch.org/whl/cu124'],
+    '11.8': ['torch==2.5.0+cu118', 'torchvision==0.20.0+cu118', '--index-url', 'https://download.pytorch.org/whl/cu118'],
+    '12.1': ['torch==2.5.0+cu121', 'torchvision==0.20.0+cu121', '--index-url', 'https://download.pytorch.org/whl/cu121'],
+    '12.4': ['torch==2.5.0+cu124', 'torchvision==0.20.0+cu124', '--index-url', 'https://download.pytorch.org/whl/cu124'],
     'cpu' : ['torch==2.5', 'torchvision==0.20'],
 }
 
 lin_torch_install_dict = {
-    '11.6': ['torch==1.13.1+cu116', 'torchvision==0.14.1+cu116', '--extra-index-url' + 'https://download.pytorch.org/whl/cu116'],
     '11.8': ['torch==2.5', 'torchvision==0.20', '--index-url', 'https://download.pytorch.org/whl/cu118'],
     '12.1': ['torch==2.5', 'torchvision==0.20', '--index-url', 'https://download.pytorch.org/whl/cu121'],
     '12.4': ['torch==2.5', 'torchvision==0.20'],
@@ -42,8 +43,18 @@ mac_torch_install_dict = {
     'cpu' : ['torch==2.5', 'torchvision==0.20'],
 }
 
-# supported cuda versions by torch
-torch_cuda_versions = ['12.4', '12.1', '11.8', '11.6']
+# supported cuda versions by torch (TagLab needs torch 2.x, so older drivers get the CPU version)
+torch_cuda_versions = ['12.4', '12.1', '11.8']
+
+def readCudaVersion(nvidia_smi_output):
+    """CUDA version supported by the NVIDIA driver, from the nvidia-smi header: "CUDA Version: 12.4" (older drivers)
+    or "CUDA UMD Version: 13.3" (newer drivers). None if it is not there."""
+    match = re.search(r'CUDA[A-Z ]*Version:\s*(\d+\.\d+)', nvidia_smi_output)
+    return match.group(1) if match else None
+
+def versionTuple(version):
+    """'12.10' -> (12, 10), so that versions compare correctly (as floats 12.10 < 12.4)."""
+    return tuple(int(part) for part in version.split('.'))
 
 if osused == 'Windows':
     torch_install_dict = win_torch_install_dict
@@ -83,16 +94,11 @@ if use_cpu == False:
     output = result[1]
     rc = result[0]
     if rc == 0:
-        pos = output.find('CUDA Version:')
-        if pos >= 0:
-            pos += 13
-            cuda_version = output[pos:pos+6]
+        cuda_version = readCudaVersion(output)
+        if cuda_version is not None:
             print('Found CUDA version: ' + cuda_version)
 
-            # get the float number of the cuda version
-            n_cuda_version = float(cuda_version)
-
-            if n_cuda_version >= float(torch_cuda_versions[-1]):
+            if versionTuple(cuda_version) >= versionTuple(torch_cuda_versions[-1]):
                 use_cuda = True
             else:
                 print('CUDA version not supported. Installing CPU version automatically...')
@@ -121,8 +127,7 @@ if use_rocm == True:
     print ('Using Torch with ROCm support.')
 elif use_cuda == True:
     for version in torch_cuda_versions:
-        n_cuda_version = float(cuda_version)
-        if n_cuda_version >= float(version):
+        if versionTuple(cuda_version) >= versionTuple(version):
             print ('Using Torch with CUDA version: ' + version)
             torch_compute_platform = version
             break
@@ -268,6 +273,18 @@ if torch_extra_argument1 != "":
     list_args.extend([torch_extra_argument1, torch_extra_argument2])
 
 subprocess.check_call(list_args)
+
+# tell whether the installed PyTorch can use the NVIDIA GPU
+if use_cuda:
+    check = subprocess.run([sys.executable, "-c",
+                            "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"],
+                           capture_output=True, text=True)
+    gpu_name = check.stdout.strip()
+    if check.returncode == 0 and gpu_name != '':
+        print('PyTorch can use the GPU: ' + gpu_name)
+    else:
+        print('WARNING: PyTorch was installed with CUDA ' + torch_compute_platform + ' but cannot use the GPU. '
+              'TagLab will run on the CPU. ' + check.stderr.strip())
 
 # gdal and rasterio
 

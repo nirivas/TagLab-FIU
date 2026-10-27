@@ -76,6 +76,10 @@ under the same GPL-3 licence. It changes the following.
 ## Installing and updating
 - **`install_windows.bat`:** installs everything into its own Python environment, using the package versions this
   version was tested with. It uses the GPU automatically when the computer has an NVIDIA graphics card.
+  - It also recognises the GPU with newer NVIDIA drivers. Those drivers print "CUDA UMD Version", and the official
+    installer then installed the CPU version.
+  - Running it again replaces a CPU version of PyTorch with the GPU version.
+  - At the end it says whether PyTorch can use the GPU.
 - **`download_models.bat`:** downloads the AI models, which are not stored on GitHub. SAM is optional.
 - **`update.bat`:** updates from this version's GitHub repository. Replaced files are backed up first.
 - **Update notice:** TagLab shows a notice at startup when a newer version is available.
