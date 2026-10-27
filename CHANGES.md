@@ -5,6 +5,9 @@ under the same GPL-3 licence. It changes the following.
 
 ## Data safety and crash fixes
 - **Errors:** an error no longer closes TagLab. A message is shown and the details are written to `TagLab.log`.
+- **Start-up crash:** on some Windows PCs, TagLab closed immediately without any message, because the map library
+  (rasterio/GDAL) clashed with the window library (PyQt5). TagLab and `batch_processing.py` now load them in an
+  order that works.
 - **Updates:** TagLab no longer refuses to start when an official update exists. Updates come from this version's own
   repository instead (see "Installing and updating").
 - **Exports:**

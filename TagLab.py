@@ -20,6 +20,9 @@
 
 import sys
 import os
+# rasterio (GDAL/PROJ) must be loaded before PyQt5: on some Windows PCs, loading it after PyQt5 crashes Python
+# without any message (access violation while rasterio sets up PROJ)
+import rasterio
 import datetime
 import shutil
 import json
