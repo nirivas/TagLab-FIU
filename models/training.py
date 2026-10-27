@@ -1,0 +1,669 @@
+import sys
+import os
+import numpy as np
+import torch
+import torch.multiprocessing
+from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch.optim as optim
+from models.deeplab import DeepLab
+from sklearn.metrics import jaccard_score
+from models.coral_dataset import CoralsDataset
+import models.losses as losses
+from PyQt5.QtWidgets import QApplication
+from qhoptim.pyt import QHAdam
+
+# SEED
+torch.manual_seed(997)
+np.random.seed(997)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+import glob
+import os
+
+
+def count_png_files(folder_path):
+
+    # WARNING!
+    # Under Windows this returns the DOUBLE of the PNG files, under Linux/Mac the exact number of the files
+
+    pattern = os.path.join(folder_path, '*.png')
+    png_files = glob.glob(pattern)
+
+    pattern_upper = os.path.join(folder_path, '*.PNG')
+    png_files += glob.glob(pattern_upper)
+
+    return len(png_files)
+
+def checkDataset(dataset_folder):
+    """
+    Check if the training, validation and test folders exist and contain the corresponding images and labels.
+    """
+
+    flag = 0
+    targetdirs = ["training", "validation", "test"]
+    if os.path.exists(dataset_folder):
+        for sub in targetdirs:
+            subfolder = os.path.join(dataset_folder, sub)
+            if os.path.exists(subfolder):
+                n_images = count_png_files(os.path.join(subfolder, 'images'))
+                n_labels = count_png_files(os.path.join(subfolder, 'labels'))
+                if n_images == n_labels:
+                    flag = 0 # Your training dataset is valid
+                else:
+                    return 3  # Files mismatch in subfolder
+            else:
+                return 2  # A subfolder is missing
+    else:
+        return 1  # Dataset folder does not exist
+
+    return flag
+
+def createTargetClasses(annotations):
+    """
+    Create the label name - label code correspondences for the classifier.
+    """
+
+    labels_set = set()
+
+    # Background class must be present
+    labels_set.add("Background")
+
+    for blob in annotations.seg_blobs:
+        if blob.qpath_gitem.isVisible():
+            labels_set.add(blob.class_name)
+
+    target_dict = {}
+    for i, label in enumerate(labels_set):
+        target_dict[label] = i
+
+    return target_dict
+
+
+def saveMetrics(metrics, filename):
+    """
+    Save the computed metrics.
+    """
+
+    file = open(filename, 'w')
+    file.write("CONFUSION MATRIX: \n\n")
+    np.savetxt(file, metrics['ConfMatrix'], fmt='%d')
+    file.write("\n")
+    file.write("NORMALIZED CONFUSION MATRIX: \n\n")
+    np.savetxt(file, metrics['NormConfMatrix'], fmt='%.3f')
+    file.write("\n")
+    file.write("ACCURACY      : %.3f\n\n" % metrics['Accuracy'])
+    file.write("Jaccard Score : %.3f\n\n" % metrics['JaccardScore'])
+    if 'ClassIoU' in metrics:
+        file.write("mIoU (mean IoU of the classes, Background excluded) : %.3f\n\n" % metrics['mIoU'])
+        file.write("IoU PER CLASS: \n\n")
+        for name, iou in zip(metrics['ClassNames'], metrics['ClassIoU']):
+            file.write("%-40s %s\n" % (name, "absent" if np.isnan(iou) else "%.3f" % iou))
+    file.close()
+
+
+# VALIDATION
+def evaluateNetwork(dataset, dataloader, loss_to_use, CEloss, w_for_GDL, tversky_loss_alpha, tversky_loss_beta,
+                    focal_tversky_gamma, epoch, epochs_switch, epochs_transition, nclasses, net,
+                    progress, flag_compute_mIoU=False, flag_test=False, savefolder=""):
+    """
+    It evaluates the network on the validation set.  
+    :param dataloader: Pytorch DataLoader to load the dataset for the evaluation.
+    :param net: Network to evaluate.
+    :param savefolder: if a folder is given the classification results are saved into this folder. 
+    :return: all the computed metrics.
+    """""
+
+    ##### SETUP THE NETWORK #####
+
+    USE_CUDA = torch.cuda.is_available()
+
+    if USE_CUDA:
+        device = torch.device("cuda")
+        net.to(device)
+        torch.cuda.synchronize()
+
+    ##### EVALUATION #####
+
+    net.eval()  # set the network in evaluation mode
+
+    batch_size = dataloader.batch_size
+
+    CM = np.zeros((nclasses, nclasses), dtype=np.int64)
+
+    num_iter = 0
+    total_iter = max(1, len(dataloader))
+
+    ypred_list = []
+    ytrue_list = []
+    loss_values_per_iter = []
+    with torch.no_grad():
+        for k, data in enumerate(dataloader):
+
+            batch_images, labels_batch, names = data['image'], data['labels'], data['name']
+            print(names)
+
+            if USE_CUDA:
+                batch_images = batch_images.to(device)
+                labels_batch = labels_batch.to(device)
+
+            # N x K x H x W --> N: batch size, K: number of classes, H: height, W: width
+            # (mixed precision on NVIDIA GPUs, the scores and the loss are computed in float32)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=USE_CUDA):
+                outputs = net(batch_images)
+            outputs = outputs.float()
+
+            # predictions size --> N x H x W
+            values, predictions_t = torch.max(outputs, 1)
+
+            if loss_to_use == "NONE":
+                loss_values_per_iter.append(0.0)
+            else:
+                loss = computeLoss(loss_to_use, CEloss, w_for_GDL, tversky_loss_alpha, tversky_loss_beta,
+                                   focal_tversky_gamma, epoch, epochs_switch, epochs_transition, labels_batch, outputs)
+
+                loss_values_per_iter.append(loss.item())
+
+            pred_cpu = predictions_t.cpu().numpy()
+            labels_cpu = labels_batch.cpu().numpy()
+
+            # the ignored pixels (label -1) are not evaluated
+            valid = labels_cpu >= 0
+            true_index = labels_cpu[valid]
+            pred_index = pred_cpu[valid]
+
+            if flag_compute_mIoU:
+                ypred_list.append(pred_index)
+                ytrue_list.append(true_index)
+
+            # CONFUSION MATRIX, PREDICTIONS ARE PER-COLUMN, GROUND TRUTH CLASSES ARE PER-ROW
+            CM += np.bincount(nclasses * true_index + pred_index,
+                              minlength=nclasses * nclasses).reshape(nclasses, nclasses)
+
+            if flag_test is True:
+                updateProgressBar(progress, "Test - Iteration ", num_iter, total_iter)
+            else:
+                updateProgressBar(progress, "Validation - Iteration ", num_iter, total_iter)
+
+            num_iter = num_iter + 1
+
+            # SAVE THE OUTPUT OF THE NETWORK
+            for i in range(batch_images.shape[0]):
+
+                if savefolder:
+                    imgfilename = os.path.join(savefolder, names[i])
+                    dataset.saveClassificationResult(batch_images[i].cpu(), outputs[i].cpu(), imgfilename)
+
+    jaccard_s = 0.0
+
+    if flag_compute_mIoU:
+        ypred = np.concatenate(ypred_list) if ypred_list else np.zeros(0, dtype=np.int64)
+        del ypred_list
+        ytrue = np.concatenate(ytrue_list) if ytrue_list else np.zeros(0, dtype=np.int64)
+        del ytrue_list
+        if len(ytrue) > 0:
+            jaccard_s = jaccard_score(ytrue, ypred, average='weighted')
+
+    # NORMALIZED CONFUSION MATRIX
+    sum_row = CM.sum(axis=1)
+    sum_row = sum_row.reshape((nclasses, 1))   # transform into column vector
+    sum_row = sum_row + 1
+    CMnorm = CM / sum_row    # divide each row using broadcasting
+
+
+    if len(loss_values_per_iter) == 0:
+        raise Exception("The " + ("test" if flag_test else "validation") + " set is empty, nothing to evaluate.")
+
+    # FINAL ACCURACY
+    pixels_total = CM.sum()
+    pixels_correct = np.sum(np.diag(CM))
+    accuracy = float(pixels_correct) / float(max(1, pixels_total))
+
+    # IoU PER CLASS (NaN for the classes absent from both the labels and the predictions) AND THEIR MEAN,
+    # Background excluded: unlike the accuracy, rare classes count as much as the frequent ones
+    tp = np.diag(CM).astype(float)
+    union = CM.sum(axis=0) + CM.sum(axis=1) - tp
+    class_iou = np.full(nclasses, np.nan)
+    present = union > 0
+    class_iou[present] = tp[present] / union[present]
+    background_index = dataset.dict_target.get("Background")
+    evaluated = [c for c in range(nclasses) if present[c] and c != background_index]
+    mIoU = float(np.mean(class_iou[evaluated])) if evaluated else 0.0
+    names_by_index = {index: name for name, index in dataset.dict_target.items()}
+    class_names = [names_by_index.get(c, str(c)) for c in range(nclasses)]
+
+    metrics = {'ConfMatrix': CM, 'NormConfMatrix': CMnorm, 'Accuracy': accuracy, 'JaccardScore': jaccard_s,
+               'ClassIoU': class_iou, 'mIoU': mIoU, 'ClassNames': class_names}
+
+    mean_loss = sum(loss_values_per_iter) / len(loss_values_per_iter)
+
+    return metrics, mean_loss
+
+
+def computeLoss(loss_name, CE, w_for_GDL, tversky_alpha, tversky_beta, focal_tversky_gamma,
+                epoch, epochs_switch, epochs_transition, labels, predictions):
+    """
+    Compute the loss given its name.
+    """
+
+    if loss_name == "CROSSENTROPY":
+        loss = CE(predictions, labels)
+    elif loss_name == "DICE":
+        loss = losses.GDL(predictions, labels, w_for_GDL)
+    elif loss_name == "BOUNDARY":
+        loss = losses.surface_loss(labels, predictions)
+    elif loss_name == "DICE+BOUNDARY":
+        if epoch >= epochs_switch:
+            alpha = 1.0 - (float(epoch - epochs_switch) / float(epochs_transition))
+            if alpha < 0.0:
+                alpha = 0.0
+            GDL = losses.GDL(predictions, labels, w_for_GDL)
+            B = losses.surface_loss(labels, predictions)
+            loss = alpha * GDL + (1.0 - alpha) * B
+
+            str = "Alpha={:.4f}, GDL={:.4f}, Boundary={:.4f}, loss={:.4f}".format(alpha, GDL, B, loss)
+            print(str)
+        else:
+            loss = losses.GDL(predictions, labels, w_for_GDL)
+    elif loss_name == "FOCAL_TVERSKY":
+        loss = losses.focal_tversky(predictions, labels, tversky_alpha, tversky_beta, focal_tversky_gamma)
+    elif loss_name == "FOCAL+BOUNDARY":
+        if epoch >= epochs_switch:
+            alpha = 1.0 - (float(epoch - epochs_switch) / float(epochs_transition))
+            if alpha < 0.0:
+                alpha = 0.0
+            loss = alpha * losses.focal_tversky(predictions, labels, tversky_alpha, tversky_beta,
+                                                focal_tversky_gamma) + (1.0 - alpha) * losses.surface_loss(labels, predictions)
+        else:
+            loss = losses.focal_tversky(predictions, labels, tversky_alpha, tversky_beta, focal_tversky_gamma)
+
+    return loss
+
+
+def updateProgressBar(progress_bar, prefix_message, num_iter, total_iter):
+    """
+    Update progress bar according to the number of iterations done.
+    """
+
+    txt = prefix_message + str(num_iter + 1) + "/" + str(total_iter)
+    progress_bar.setMessage(txt)
+    perc_training = round((100.0 * num_iter) / total_iter)
+    progress_bar.setProgress(perc_training)
+    QApplication.processEvents()
+
+
+def trainingNetwork(images_folder_train, labels_folder_train, images_folder_val, labels_folder_val,
+                    labels_dictionary, target_classes, output_classes, save_network_as, classifier_name,
+                    epochs, epochs_stage1, epochs_stage2, batch_sz, batch_mult, learning_rate, L2_penalty, validation_frequency, loss_to_use,
+                    epochs_switch, epochs_transition, tversky_alpha, tversky_gamma, optimiz, freeze_strategy,
+                    flag_shuffle, flag_training_accuracy, progress, ignore_unannotated=False):
+
+    ##### DATA #####
+
+    # setup the training dataset
+    datasetTrain = CoralsDataset(images_folder_train, labels_folder_train, labels_dictionary, target_classes)
+    datasetTrain.ignore_unannotated = ignore_unannotated
+
+    print("Dataset setup..", end='')
+    datasetTrain.computeAverage()
+    datasetTrain.computeWeights()
+    print(datasetTrain.dict_target)
+    print(datasetTrain.weights)
+    freq = 1.0 / datasetTrain.weights
+    print(freq)
+    print("done.")
+
+    save_classifier_as = save_network_as.replace(".net", ".json")
+
+    datasetTrain.enableAugumentation()
+
+    datasetVal = CoralsDataset(images_folder_val, labels_folder_val, labels_dictionary, datasetTrain.dict_target)
+    datasetVal.ignore_unannotated = ignore_unannotated
+    datasetVal.dataset_average = datasetTrain.dataset_average
+    datasetVal.weights = datasetTrain.weights
+
+    #AUGUMENTATION IS NOT APPLIED ON THE VALIDATION SET
+    datasetVal.disableAugumentation()
+
+    # setup the data loader
+    # parallel data loading only on Linux (e.g. HPC): on Windows each worker process would import TagLab again
+    loader_workers = 4 if sys.platform.startswith("linux") else 0
+    dataloaderTrain = DataLoader(datasetTrain, batch_size=batch_sz, shuffle=flag_shuffle, num_workers=loader_workers,
+                                 drop_last=True, pin_memory=True, persistent_workers=loader_workers > 0)
+
+    # drop_last=False: a validation set smaller than the batch size must still be evaluated
+    validation_batch_size = 4
+    dataloaderVal = DataLoader(datasetVal, batch_size=validation_batch_size, shuffle=False, num_workers=loader_workers,
+                               drop_last=False, pin_memory=True, persistent_workers=loader_workers > 0)
+
+    training_images_number = len(datasetTrain.images_names)
+    validation_images_number = len(datasetVal.images_names)
+
+    if training_images_number < batch_sz:
+        raise Exception("The training set has {:d} tiles, fewer than the batch size ({:d}). "
+                        "Export a larger training area or reduce the batch size.".format(training_images_number, batch_sz))
+
+    if validation_images_number == 0:
+        raise Exception("The validation set is empty. Export the dataset again with a larger area.")
+
+    print("NETWORK USED: DEEPLAB V3+")
+
+    ###### SETUP THE NETWORK #####
+    # num_classes parmeters adapt the num classes to the new dictionary
+    net = DeepLab(backbone='resnet', output_stride=16, num_classes=output_classes)
+
+    if torch.cuda.is_available():
+        state = torch.load("models/deeplab-resnet.pth.tar", weights_only=False, map_location=torch.device("cuda"))
+    else:
+        state = torch.load("models/deeplab-resnet.pth.tar", weights_only=False, map_location=torch.device("cpu"))
+
+    # RE-INIZIALIZE THE CLASSIFICATION LAYER WITH THE RIGHT NUMBER OF CLASSES, DON'T LOAD WEIGHTS OF THE CLASSIFICATION LAYER
+    new_dictionary = state['state_dict']
+    del new_dictionary['decoder.last_conv.8.weight']
+    del new_dictionary['decoder.last_conv.8.bias']
+    net.load_state_dict(state['state_dict'], strict=False)
+
+    # OPTIMIZER
+
+    # if freeze_strategy is True:
+    #
+    # Stage 1 - the last layer of the decoder is first stabilized (for EPOCH_SWITCH_FIRST_UNFREEZE)
+    # Stage 2 - unfreeze all the decoeder (not only the last layer) (for EPOCH_SWITCH_SECOND_UNFREEZE)
+    # Stage 3 - unfreeze all the DeeplabV3+ layers
+
+    EPOCH_SWITCH_FIRST_UNFREEZE = epochs_stage1
+    EPOCH_SWITCH_SECOND_UNFREEZE = epochs_stage1 + epochs_stage2
+
+    if optimiz == "SGD":
+        optimizer = optim.SGD(net.parameters(), lr=learning_rate, weight_decay=L2_penalty, momentum=0.9)
+    elif optimiz == "ADAM" and freeze_strategy is False:
+        optimizer = optim.Adam(net.parameters(), lr=learning_rate, weight_decay=L2_penalty)
+    elif optimiz == "ADAM" and freeze_strategy is True:
+
+        # different learning rates are used for different part of the DeepLab in this case
+
+        # base learning_rate = 0.01
+        lr1 = learning_rate * 2.0
+        lr2 = learning_rate / 10.0
+
+        optimizer = optim.Adam([{'params': [param for name, param in net.named_parameters() if 'decoder.last_conv' not in name]},
+                  {'params': net.decoder.last_conv.parameters(), 'lr': lr1}], lr=lr2, weight_decay=L2_penalty)
+
+    elif optimiz == "QHADAM" and freeze_strategy is False:
+
+        optimizer = QHAdam(net.parameters(), lr=learning_rate, weight_decay=L2_penalty,
+                           nus = (0.7, 1.0), betas = (0.99, 0.999))
+
+    elif optimiz == "QHADAM" and freeze_strategy is True:
+
+        # different learning rates are used for different part of the DeepLab in this case
+
+        # base learning_rate = 0.01
+        lr1 = learning_rate * 2.0
+        lr2 = learning_rate / 10.0
+        optimizer = QHAdam([{'params': [param for name, param in net.named_parameters() if 'decoder.last_conv' not in name]},
+             {'params': net.decoder.last_conv.parameters(), 'lr': lr1}], lr=lr2, weight_decay=L2_penalty,
+                           nus = (0.7, 1.0), betas = (0.99, 0.999))
+
+    USE_CUDA = torch.cuda.is_available()
+
+    if USE_CUDA:
+        device = torch.device("cuda")
+        # fastest convolution algorithms (the results are no longer bit-for-bit reproducible)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+    else:
+        device = torch.device("cpu")
+
+    net.to(device)
+
+    # mixed precision on NVIDIA GPUs (no effect on CPU)
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_CUDA)
+
+    ##### TRAINING LOOP #####
+
+    if freeze_strategy is True:
+        for param in net.parameters():
+            param.requires_grad = False
+
+        for param in net.decoder.last_conv[8].parameters():
+            param.requires_grad = True
+
+
+    reduce_lr_patience = 2
+    if loss_to_use == "DICE+BOUNDARY":
+        reduce_lr_patience = 200
+        print("patience increased !")
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.25, patience=reduce_lr_patience)
+
+    best_accuracy = 0.0
+    best_mIoU = 0.0
+
+    # Crossentropy loss
+    weights = datasetTrain.weights
+    if torch.cuda.is_available():
+        class_weights = torch.FloatTensor(weights).cuda()
+    else:
+        class_weights = torch.FloatTensor(weights)
+    CEloss = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
+
+    # weights for GENERALIZED DICE LOSS (GDL)
+    freq = 1.0 / datasetTrain.weights[1:]
+    w = 1.0 / (freq * freq)
+    w = w / w.sum() + 0.00001
+    w_for_GDL = torch.from_numpy(w)
+    w_for_GDL = w_for_GDL.to(device)
+
+    # Focal Tversky loss
+    focal_tversky_gamma = torch.tensor(tversky_gamma)
+    focal_tversky_gamma = focal_tversky_gamma.to(device)
+
+    tversky_loss_alpha = torch.tensor(tversky_alpha)
+    tversky_loss_beta = torch.tensor(1.0 - tversky_alpha)
+    tversky_loss_alpha = tversky_loss_alpha.to(device)
+    tversky_loss_beta = tversky_loss_beta.to(device)
+
+
+    print("Training Network")
+    num_iter = 0
+    total_iter = epochs * int(len(datasetTrain) / dataloaderTrain.batch_size)
+
+    # mean loss value per-epoch
+    loss_values_train = []
+    loss_values_val = []
+
+    network_saved = False
+
+    for epoch in range(1, epochs + 1):
+
+        net.train()
+        optimizer.zero_grad()
+
+        loss_values_per_iter = []
+        for i, minibatch in enumerate(dataloaderTrain):
+
+            updateProgressBar(progress, "Training - Iteration ", num_iter, total_iter)
+            num_iter += 1
+
+            # get the inputs
+            images_batch = minibatch['image']
+            labels_batch = minibatch['labels']
+
+            if USE_CUDA:
+                images_batch = images_batch.to(device)
+                labels_batch = labels_batch.to(device)
+
+            # forward+loss+backward (the loss is computed in float32)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=USE_CUDA):
+                outputs = net(images_batch)
+
+            loss = computeLoss(loss_to_use, CEloss, w_for_GDL, tversky_loss_alpha, tversky_loss_beta, focal_tversky_gamma,
+                               epoch, epochs_switch, epochs_transition, labels_batch, outputs.float())
+
+            scaler.scale(loss).backward()
+
+            # TO AVOID MEMORY TROUBLE UPDATE WEIGHTS EVERY BATCH SIZE x BATCH MULT
+            if (i+1)% batch_mult == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            print(epoch, i, loss.item())
+            loss_values_per_iter.append(loss.item())
+
+        mean_loss_train = sum(loss_values_per_iter) / len(loss_values_per_iter)
+        print("Epoch: %d , Mean loss = %f" % (epoch, mean_loss_train))
+
+        loss_values_train.append(mean_loss_train)
+
+        ### VALIDATION ### (the last epoch is always validated)
+        if epoch % validation_frequency == 0 or epoch == epochs:
+
+            print("RUNNING VALIDATION.. ", end='')
+
+            metrics_val, mean_loss_val = evaluateNetwork(datasetVal, dataloaderVal, loss_to_use, CEloss, w_for_GDL,
+                                                         tversky_loss_alpha, tversky_loss_beta, focal_tversky_gamma,
+                                                         epoch, epochs_switch, epochs_transition,
+                                                         output_classes, net, progress, flag_compute_mIoU=False,
+                                                         flag_test=False)
+            accuracy = metrics_val['Accuracy']
+            mIoU = metrics_val['mIoU']
+            scheduler.step(mean_loss_val)
+            loss_values_val.append(mean_loss_val)
+
+            accuracy_training = 0.0
+            jaccard_training = 0.0
+
+            if flag_training_accuracy is True:
+                metrics_train, mean_loss_train = evaluateNetwork(datasetTrain, dataloaderTrain, loss_to_use, CEloss, w_for_GDL,
+                                                                 tversky_loss_alpha, tversky_loss_beta, focal_tversky_gamma,
+                                                                 epoch, epochs_switch, epochs_transition,
+                                                                 output_classes, net, progress,
+                                                                 flag_compute_mIoU=False, flag_test=False)
+                accuracy_training = metrics_train['Accuracy']
+                jaccard_training = metrics_train['JaccardScore']
+
+            # the best network is the one with the highest mean IoU of the classes (Background excluded):
+            # the pixel accuracy is dominated by the most frequent classes
+            if mIoU > best_mIoU or not network_saved:
+                best_mIoU = mIoU
+                best_accuracy = accuracy
+                torch.save(net.state_dict(), save_network_as)
+                network_saved = True
+                # performance of the best network on the validation dataset
+                metrics_filename = save_network_as[:len(save_network_as) - 4] + "-val-metrics.txt"
+                saveMetrics(metrics_val, metrics_filename)
+
+            # checkpoints
+            #temp_dir = "C:/temp"
+            #checkpoint_name = save_network_as.replace(".net", "_checkpoint_{:d}.net".format(epoch))
+            #checkpoint_filename = os.path.join(temp_dir, os.path.basename(checkpoint_name))
+            #torch.save(net.state_dict(), os.path.join(temp_dir, checkpoint_filename))
+            #metrics_filename = checkpoint_filename[:len(checkpoint_filename) - 4] + "-val-metrics.txt"
+            #saveMetrics(metrics_val, metrics_filename)
+
+            print("-> mIoU {:.4f} (accuracy {:.4f}), BEST mIoU {:.4f}".format(mIoU, accuracy, best_mIoU))
+
+            # restore training messages
+            updateProgressBar(progress, "Training - Iteration ", num_iter, total_iter)
+
+        # unfreeze after stabilization of the classifier
+        if epoch == EPOCH_SWITCH_FIRST_UNFREEZE and freeze_strategy is True:
+
+            # base learning_rate = 0.01
+            lr1 = learning_rate
+            lr2 = learning_rate / 5.0
+
+            if optimiz == "ADAM":
+                optimizer = optim.Adam(
+                    [{'params': [param for name, param in net.named_parameters() if 'decoder.last_conv' not in name]},
+                     {'params': net.decoder.last_conv.parameters(), 'lr': lr1}], lr=lr2, weight_decay=L2_penalty)
+            elif optimiz == "QHADAM":
+                optimizer = QHAdam(
+                    [{'params': [param for name, param in net.named_parameters() if 'decoder.last_conv' not in name]},
+                     {'params': net.decoder.last_conv.parameters(), 'lr': lr1}], lr=lr2, weight_decay=L2_penalty,
+                    nus = (0.7, 1.0), betas = (0.99, 0.999))
+            else:
+                raise Exception("Invalid optimizer name!")
+
+            for param in net.decoder.parameters():
+                param.requires_grad = True
+
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.25, patience=reduce_lr_patience)
+
+        if epoch == EPOCH_SWITCH_SECOND_UNFREEZE and freeze_strategy is True:
+
+            lr1 = learning_rate
+            lr2 = learning_rate / 5.0
+
+            if optimiz == "ADAM":
+                optimizer = optim.Adam(
+                    [{'params': [param for name, param in net.named_parameters() if 'decoder.last_conv' not in name]},
+                     {'params': net.decoder.last_conv.parameters(), 'lr': lr1}], lr=lr2, weight_decay=L2_penalty)
+            elif optimiz == "QHADAM":
+                optimizer = QHAdam(
+                    [{'params': [param for name, param in net.named_parameters() if 'decoder.last_conv' not in name]},
+                     {'params': net.decoder.last_conv.parameters(), 'lr': lr1}], lr=lr2, weight_decay=L2_penalty,
+                   nus = (0.7, 1.0), betas = (0.99, 0.999))
+            else:
+                raise Exception("Invalida optimizer name!")
+
+            for param in net.parameters():
+                param.requires_grad = True
+
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.25, patience=reduce_lr_patience)
+
+
+    # main loop ended
+    torch.cuda.empty_cache()
+    del net
+    net = None
+
+    print("***** TRAINING FINISHED *****")
+    print("BEST mIoU REACHED ON THE VALIDATION SET: %.3f (accuracy %.3f)" % (best_mIoU, best_accuracy))
+
+    return datasetTrain, loss_values_train, loss_values_val
+
+
+def testNetwork(images_folder, labels_folder, labels_dictionary, target_classes, dataset_train,
+                network_filename, output_folder, progress):
+    """
+    Load a network and test it on the test dataset.
+    :param network_filename: Full name of the network to load (PATH+name)
+    """
+
+    # TEST DATASET
+    datasetTest = CoralsDataset(images_folder, labels_folder, labels_dictionary, target_classes)
+    datasetTest.disableAugumentation()
+    datasetTest.ignore_unannotated = dataset_train.ignore_unannotated
+
+    datasetTest.num_classes = dataset_train.num_classes
+    datasetTest.weights = dataset_train.weights
+    datasetTest.dataset_average = dataset_train.dataset_average
+    datasetTest.dict_target = dataset_train.dict_target
+
+    output_classes = dataset_train.num_classes
+
+    batchSize = 4
+    dataloaderTest = DataLoader(datasetTest, batch_size=batchSize, shuffle=False, num_workers=0, drop_last=False,
+                            pin_memory=True)
+
+    # DEEPLAB V3+
+    net = DeepLab(backbone='resnet', output_stride=16, num_classes=output_classes)
+
+    if torch.cuda.is_available():
+        net.load_state_dict(torch.load(network_filename, weights_only=False, map_location=torch.device("cuda")))
+    else:
+        net.load_state_dict(torch.load(network_filename, weights_only=False, map_location=torch.device("cpu")))
+
+    print("Weights loaded.")
+
+    metrics_test, loss = evaluateNetwork(datasetTest, dataloaderTest, "NONE", None, [0.0], 0.0, 0.0, 0.0, 0, 0, 0,
+                                         output_classes, net, progress, True, True, output_folder)
+    metrics_filename = network_filename[:len(network_filename) - 4] + "-test-metrics.txt"
+    saveMetrics(metrics_test, metrics_filename)
+    print("***** TEST FINISHED *****")
+
+    return metrics_test
