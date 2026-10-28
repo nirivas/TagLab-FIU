@@ -34,6 +34,7 @@ from source.Point import Point
 from source.Annotation import Blob
 from source.Tools import Tools
 from source.Label import Label
+from source.DemMetrics import DEM_METRIC_NAMES
 import source.Mask as Mask
 
 from source.QtImageViewer import QtImageViewer
@@ -150,6 +151,7 @@ class QtImageViewerPlus(QtImageViewer):
         self.toolsMessagePanel.hide()
 
         self.undo_data = Undo()
+        self.last_nudge = None   # undo step of the last move with the arrow keys (the next ones are merged into it)
 
         self.dragSelectionStart = None
         self.dragSelectionRect = None
@@ -851,6 +853,9 @@ class QtImageViewerPlus(QtImageViewer):
         if tool == "SELECTPOINTS" or tool == "SELECTAREA" or tool == "RITM" or tool == "RULER":
             QApplication.setOverrideCursor(Qt.CrossCursor)
 
+        if tool == "MOVEREGION":
+            QApplication.setOverrideCursor(Qt.SizeAllCursor)
+
         if tool == "WATERSHED":
             self.tools.tools["WATERSHED"].scribbles.setScaleFactor(self.zoom_factor)
             self.tools.tools["WATERSHED"].setActiveLabel(self.project.labels.get(self.active_label if (self.active_label is not None) else "Empty"))
@@ -1012,7 +1017,8 @@ class QtImageViewerPlus(QtImageViewer):
             self.leftMouseButtonPressed.emit(x, y)
 
             if mods & Qt.ShiftModifier and (self.tools.tool in ["WATERSHED", "FREEHAND", "EDITBORDER", "CUT",\
-                "ASSIGN", "RULER", "FOURCLICKS", "RITM", "MATCH", "PLACEANNPOINT", "SAM", "SAMINTERACTIVE"]):
+                "ASSIGN", "RULER", "FOURCLICKS", "RITM", "MATCH", "PLACEANNPOINT", "SAM", "SAMINTERACTIVE",
+                "MOVEREGION"]):
                 self.tools.leftPressed(x, y, mods)
 
             elif mods & Qt.AltModifier and self.tools.tool == "WATERSHED":
@@ -1128,9 +1134,19 @@ class QtImageViewerPlus(QtImageViewer):
         if event.button() == Qt.LeftButton:
             self.selectOp(scenePos.x(), scenePos.y())
 
+    NUDGE_KEYS = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0), Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
+
     def keyPressEvent(self, event):
 
         # keys handling goes here..
+
+        # Move Region tool: the arrow keys move the selected regions (instead of scrolling the view)
+        if self.tools.tool == "MOVEREGION" and event.key() in self.NUDGE_KEYS and len(self.selected_blobs) > 0:
+            step = 10 if event.modifiers() & Qt.ShiftModifier else 1
+            dx, dy = self.NUDGE_KEYS[event.key()]
+            self.nudgeSelected(dx * step, dy * step)
+            event.accept()
+            return
 
         super().keyPressEvent(event)
 
@@ -1708,6 +1724,68 @@ class QtImageViewerPlus(QtImageViewer):
         if redraw:
             self.scene.invalidate()
 
+    def clampShift(self, blobs, dx, dy):
+        """
+        The shift (dx, dy), reduced so that the outlines stay inside the map (a region already crossing an edge is
+        not pushed back, it just cannot go further).
+        """
+        if len(blobs) == 0 or self.image is None:
+            return 0, 0
+        x0 = min(float(b.contour[:, 0].min()) for b in blobs)
+        y0 = min(float(b.contour[:, 1].min()) for b in blobs)
+        x1 = max(float(b.contour[:, 0].max()) for b in blobs)
+        y1 = max(float(b.contour[:, 1].max()) for b in blobs)
+        last_x, last_y = int(self.image.width) - 1, int(self.image.height) - 1
+        dx = min(max(int(dx), min(0, math.ceil(-x0))), max(0, math.floor(last_x - x1)))
+        dy = min(max(int(dy), min(0, math.ceil(-y0))), max(0, math.floor(last_y - y1)))
+        return dx, dy
+
+    def moveBlobs(self, blobs, dx, dy, merge=False):
+        """
+        Move the regions by (dx, dy) whole pixels, as one undo step (with merge, the step is merged into the last
+        one). The regions keep their ids, so their matches with the other maps; the values measured at the old place
+        (surface area, DEM metrics) are cleared. Returns the moved regions.
+        """
+        dx, dy = self.clampShift(blobs, dx, dy)
+        if dx == 0 and dy == 0:
+            return []
+
+        moved = []
+        for blob in list(blobs):
+            new_blob = blob.copy()
+            new_blob.translate(dx, dy)
+            new_blob.correspondence_to_check = blob.correspondence_to_check
+            new_blob.surface_area = 0.0
+            for name in DEM_METRIC_NAMES:
+                new_blob.data.pop(name, None)
+            self.updateBlob(blob, new_blob, selected=True, redraw=False)
+            moved.append(new_blob)
+
+        if merge:
+            operation = self.undo_data.operation
+            self.project.syncCorrespondences(self.image, operation['remove'], operation['add'])
+            self.undo_data.mergePendingIntoLast()
+        else:
+            self.saveUndo()
+
+        self.scene.invalidate()
+        self.logfile.info("[TOOL][MOVEREGION] Region(s) {:s} moved by ({:d}, {:d}) px.".format(
+            ", ".join(str(b.id) for b in moved), dx, dy))
+        return moved
+
+    def nudgeSelected(self, dx, dy):
+        """
+        Move the selected regions with the arrow keys: consecutive moves of the same regions are one undo step.
+        """
+        blobs = list(self.selected_blobs)
+        last = self.undo_data.peekUndo()
+        merge = last is not None and last is self.last_nudge and self.undo_data.peekRedo() is None and \
+            len(self.undo_data.operation['add']) == 0 and len(self.undo_data.operation['remove']) == 0 and \
+            set(id(b) for b in blobs) == set(id(b) for b in last['remove'])
+        moved = self.moveBlobs(blobs, dx, dy, merge=merge)
+        if len(moved) > 0:
+            self.last_nudge = self.undo_data.peekUndo()
+
     def deleteSelectedBlobs(self):
 
         if len(self.selected_blobs) > 0:
@@ -1820,6 +1898,8 @@ class QtImageViewerPlus(QtImageViewer):
         operation = self.undo_data.undo()
         if operation is None:
             return
+        # the next arrow press of the Move Region tool starts a new undo step
+        self.last_nudge = None
 
         for blob in operation['remove']:
             message = "[UNDO][REMOVE] BLOBID={:d} VERSION={:d}".format(blob.id, blob.version)
@@ -1858,6 +1938,7 @@ class QtImageViewerPlus(QtImageViewer):
         operation = self.undo_data.redo()
         if operation is None:
             return
+        self.last_nudge = None
 
         if 'rows' in operation:
             # the matches of the regions deleted again, as they are now

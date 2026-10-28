@@ -64,6 +64,7 @@ import csv
 import source.Mask as Mask
 import source.RasterOps as rasterops
 from source import DemMetrics
+from source import Alignment as AL
 from source import PointsFromRegions
 from source import CarryOver
 from source.QtCarryOverWidget import QtCarryOverWidget
@@ -287,6 +288,7 @@ class TagLab(QMainWindow):
         self.background_progress = None
         self.carryover_review = None
         self.carryover_reasons = {}   # image id -> {region id: reasons}, for the review panel (not saved)
+        self.ritm_refit = None        # RITM network of the Move Region tool's re-fit (freed when the tool changes)
 
         self.trainYourNetworkWidget = None
         self.datasetManagerWidget = None
@@ -326,7 +328,8 @@ class TagLab(QMainWindow):
         self.btnAssign             = self.newButton("bucket.png",   "Assign class to region",   flatbuttonstyle, self.assign)
         self.btnEditBorder         = self.newButton("edit.png",     "Edit region border",       flatbuttonstyle, self.editBorder)
         self.btnCut                = self.newButton("scissors.png", "Cut region",               flatbuttonstyle, self.cut)
-        self.btnRuler              = self.newButton("ruler.png",    "Measure tool",           flatbuttonstyle, self.ruler)
+        self.btnMoveRegion         = self.newButton("moveregion.png", "Move region (SHIFT + drag or arrow keys; SPACE re-fits the outline)", flatbuttonstyle, self.moveRegion)
+        self.btnRuler             = self.newButton("ruler.png",    "Measure tool",           flatbuttonstyle, self.ruler)
 
         # Split blob operation removed from the toolbar
         # self.btnSplitBlob   = self.newButton("split.png",    "Split Blob",            flatbuttonstyle1, self.splitBlob)
@@ -374,6 +377,7 @@ class TagLab(QMainWindow):
         layout_tools.addWidget(self.btnAssign)        
         layout_tools.addWidget(self.btnEditBorder)
         layout_tools.addWidget(self.btnCut)
+        layout_tools.addWidget(self.btnMoveRegion)
         #layout_tools.addWidget(self.btnCreateCrack)
         layout_tools.addWidget(self.btnRuler)
         layout_tools.addWidget(labelSeparator2) #separator-----------------------------------        
@@ -2202,8 +2206,17 @@ class TagLab(QMainWindow):
         elif event.key() == Qt.Key_Space:
             if self.activeviewer.tools.tool == "MATCH":
                 self.createMatch()
+            elif self.activeviewer.tools.tool == "MOVEREGION":
+                self.refitSelectedRegions()
             else:
                 self.activeviewer.tools.applyTool()
+
+        elif event.key() in QtImageViewerPlus.NUDGE_KEYS and self.activeviewer is not None and \
+                self.activeviewer.tools.tool == "MOVEREGION" and len(self.activeviewer.selected_blobs) > 0:
+            # the arrow keys when the map does not have the focus
+            step = 10 if event.modifiers() & Qt.ShiftModifier else 1
+            dx, dy = QtImageViewerPlus.NUDGE_KEYS[event.key()]
+            self.activeviewer.nudgeSelected(dx * step, dy * step)
 
 
     def setBlobVisualization(self):
@@ -2998,6 +3011,7 @@ class TagLab(QMainWindow):
         self.btnAssign.setChecked(False)
         self.btnEditBorder.setChecked(False)
         self.btnCut.setChecked(False)
+        self.btnMoveRegion.setChecked(False)
         self.btnFreehand.setChecked(False)
         self.btnWatershed.setChecked(False)
         self.btnBricksSegmentation.setChecked(False)
@@ -3028,6 +3042,7 @@ class TagLab(QMainWindow):
             "ASSIGN"       : ["Assign"       , self.btnAssign],
             "EDITBORDER"   : ["Edit Border"  , self.btnEditBorder],
             "CUT"          : ["Cut"          , self.btnCut],
+            "MOVEREGION"   : ["Move Region"  , self.btnMoveRegion],
             "FREEHAND"     : ["Freehand"     , self.btnFreehand],
             "WATERSHED"    : ["Watershed"    , self.btnWatershed],
             # "BRICKS"       : ["Bricks",        self.btnBricksSegmentation],
@@ -3041,6 +3056,8 @@ class TagLab(QMainWindow):
             # "SAM_NEW"    : ["Sam New", self.btnSam_new],
         }
         newtool = tools[tool]
+        if tool != "MOVEREGION":
+            self.freeRitmRefit()
         self.resetToolbar()
         self.viewerplus.setTool(tool)
         self.viewerplus2.setTool(tool)
@@ -3096,6 +3113,14 @@ class TagLab(QMainWindow):
         CUT
         """
         self.setTool("CUT")
+
+    @pyqtSlot()
+    def moveRegion(self):
+        """
+        Activate the "Move Region" tool: SHIFT + drag or the arrow keys move the selected regions, SPACE re-fits
+        their outlines to the image.
+        """
+        self.setTool("MOVEREGION")
 
     @pyqtSlot()
     def freehandSegmentation(self):
@@ -4531,9 +4556,71 @@ class TagLab(QMainWindow):
 
     @pyqtSlot()
     def closeAlignmentTool(self):
+        widget = self.align_tool_widget
         self.align_tool_widget = None
+        if widget is not None and len(widget.replacements) > 0:
+            # the aligned map (and the extended reference) take the place of the original maps
+            self.replaceImages(widget.replacements, widget.workingAreaShift)
+            logfile.info("[ALIGNMENT] " + widget.resultLog)
+            msgBox = QMessageBox()
+            msgBox.setWindowTitle(self.TAGLAB_VERSION)
+            msgBox.setText(widget.resultMessage)
+            msgBox.exec()
         self.updateToolStatus()
         self.updateImageSelectionMenu()
+        self.updatePanels()
+
+    def replaceImages(self, replacements, working_area_shift=None):
+        """
+        Put the transformed copies made by Rotate Map and by the Alignment Tool in place of the original maps:
+        replacements is a list of (original map, copy, M), M mapping the pixels of the original to those of the copy.
+        The copies take the name and the id of the originals; the original files stay on disk. The working area is
+        shifted by working_area_shift (dx, dy) if given (the reference map was extended to the left/top).
+        """
+        olds = [old for (old, new, M) in replacements]
+
+        review = self.carryover_review
+        if review is not None and (review.source_image in olds or review.target_image in olds):
+            self.closeCarryOverReview()
+
+        shown1 = self.viewerplus.image in olds
+        shown2 = self.viewerplus2.image in olds
+        index1 = self.comboboxSourceImage.currentIndex()
+        index2 = self.comboboxTargetImage.currentIndex()
+
+        for (old, new, M) in replacements:
+            self.project.replaceImage(old, new, M)
+            if self.last_image_loaded is old:
+                self.last_image_loaded = new
+            logfile.info("[PROJECT] Map '" + new.id + "' replaced: it now uses " +
+                         ", ".join(ch.filename for ch in new.channels) + ".")
+
+        if working_area_shift is not None and self.project.working_area is not None:
+            dx, dy = working_area_shift
+            top, left, w, h = self.project.working_area
+            self.project.working_area = [top + dy, left + dx, w, h]
+
+        # the viewers that showed an original map show its copy (with a new undo history, as when a map is loaded)
+        self.updateImageSelectionMenu()
+        n = len(self.project.images)
+        if self.split_screen_flag and (shown1 or shown2) and 0 <= index1 < n and 0 <= index2 < n:
+            self.doNotUpdatePanels()
+            for (viewer, shown, index) in [(self.viewerplus, shown1, index1), (self.viewerplus2, shown2, index2)]:
+                if shown:
+                    viewer.clear()
+                    viewer.setProject(self.project)
+                    viewer.setImage(self.project.images[index])
+            self.setBlobVisualization()
+            self.doUpdatePanels()
+        elif shown1 and 0 <= index1 < n:
+            self.showImage(self.project.images[index1])
+
+        for viewer in (self.viewerplus, self.viewerplus2):
+            if viewer.image is not None:
+                viewer.setProject(self.project)
+                viewer.drawWorkingArea()
+
+        self.updateToolStatus()
         self.updatePanels()
 
     @pyqtSlot()
@@ -4553,15 +4640,18 @@ class TagLab(QMainWindow):
         if dialog.exec() != QDialog.Accepted or dialog.newImage is None:
             return
 
-        self.project.addNewImage(dialog.newImage, sort=True)
-        self.updateToolStatus()
-        self.updateImageSelectionMenu()
-        self.updatePanels()
+        old = dialog.oldImage
+        lost = AL.notCarriedOver(old)
+        self.replaceImages([(old, dialog.newImage, dialog.matrix)])
 
-        logfile.info("[PROJECT] The rotated map '" + dialog.newImage.id + "' has been added to the project.")
+        logfile.info("[PROJECT] The map '" + old.id + "' has been rotated.")
 
-        txt = "The rotated map '" + dialog.newImage.name + "' has been added to the project " \
-              "(the new image files are next to the original ones).\n\nRemember to save the project (File > Save)."
+        txt = "The map '" + old.name + "' now uses the rotated image files:\n" + \
+              "\n".join(os.path.basename(ch.filename) for ch in dialog.newImage.channels) + \
+              "\n\nThe original files are unchanged (they are no longer part of the project once you save it)." \
+              "\n\nRemember to save the project (File > Save)."
+        if len(lost) > 0:
+            txt += "\n\nNot carried over to the rotated map: " + ", ".join(lost) + "."
         if self.project.working_area is not None:
             txt += "\n\nNote: the working area refers to the original orientation of the maps."
         msgBox = QMessageBox()
@@ -4808,7 +4898,7 @@ class TagLab(QMainWindow):
     @pyqtSlot()
     def updateToolStatus(self):
 
-        for button in [self.btnMove, self.btnPoint, self.btnAssign, self.btnEditBorder, self.btnCut, self.btnFreehand,
+        for button in [self.btnMove, self.btnPoint, self.btnAssign, self.btnEditBorder, self.btnCut, self.btnMoveRegion, self.btnFreehand,
                        self.btnCreateCrack, self.btnWatershed, self.btnBricksSegmentation, self.btnRows, self.btnRuler, self.btnFourClicks,
                        self.btnRitm,self.btnSam, self.btnAutoClassification, self.btnCreateGrid, self.btnGrid]:
             button.setEnabled(len(self.project.images) > 0)
@@ -6683,6 +6773,8 @@ class TagLab(QMainWindow):
         review.showColony[int, int].connect(self.showCarriedColony)
         review.keepColony[int].connect(self.keepCarriedColony)
         review.removeColony[int].connect(self.removeCarriedColony)
+        review.moveColony[int].connect(self.moveCarriedColony)
+        review.refitColony[int].connect(self.refitCarriedColony)
         review.closed.connect(self.carryOverReviewClosed)
         self.carryover_review = review
         # N is the shortcut of Regions > Create a Background Region: while reviewing it means "next colony"
@@ -6792,6 +6884,152 @@ class TagLab(QMainWindow):
         if self.compare_panel.isVisible():
             self.compare_panel.setTable(self.project, self.comboboxSourceImage.currentIndex(),
                                         self.comboboxTargetImage.currentIndex())
+
+    @pyqtSlot(int)
+    def moveCarriedColony(self, target_id):
+        """
+        Select the colony in the new map and activate the Move Region tool (SHIFT + drag or the arrow keys).
+        """
+        if not self.carryOverReviewPair():
+            return
+
+        viewer = self.viewerplus2
+        blob = viewer.annotations.blobById(target_id)
+        if blob is None:
+            return
+
+        self.setTool("MOVEREGION")
+        viewer.resetSelection()
+        viewer.addToSelectedList(blob)
+        self.activeviewer = viewer
+        self.inactiveviewer = self.viewerplus
+        viewer.setFocus()
+
+    @pyqtSlot(int)
+    def refitCarriedColony(self, target_id):
+        """
+        Re-fit the outline of the colony in the new map with RITM (its carry-over status does not change).
+        """
+        if not self.carryOverReviewPair():
+            return
+
+        viewer = self.viewerplus2
+        blob = viewer.annotations.blobById(target_id)
+        if blob is None:
+            return
+
+        self.activeviewer = viewer
+        self.inactiveviewer = self.viewerplus
+        self.refitSelectedRegions(viewer, [blob])
+        if self.carryover_review is not None:
+            self.carryover_review.refresh()
+
+    def freeRitmRefit(self):
+        if self.ritm_refit is not None:
+            self.ritm_refit.close()
+            self.ritm_refit = None
+
+    def refitSelectedRegions(self, viewer=None, blobs=None):
+        """
+        Re-fit the outlines of the regions (by default the selected regions of the active map) to the image with
+        RITM, as the carry-over does: the outline is the starting mask, with one click inside. A new outline is used
+        only if it overlaps the old one enough and its area does not change too much (CarryOver.acceptRefit). The
+        regions keep their ids (so their matches), class and attributes; the DEM metrics are dropped. All the
+        re-fits are one undo step. It returns the number of regions re-fitted.
+        """
+        viewer = self.activeviewer if viewer is None else viewer
+        if viewer is None or viewer.image is None:
+            return 0
+
+        blobs = list(viewer.selected_blobs) if blobs is None else list(blobs)
+        if len(blobs) == 0:
+            box = QMessageBox()
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("Select the regions to re-fit first, then press SPACE.")
+            box.exec()
+            return 0
+
+        # the image windows are read here (the map belongs to the GUI thread); RITM runs in the background
+        qimage = self.channelQImage(viewer.image)
+        jobs = []
+        for blob in blobs:
+            top, left, w, h = CarryOver.refitBox(blob, viewer.image.width, viewer.image.height)
+            if w <= 0 or h <= 0:
+                continue
+            img = genutils.qimageToNumpyArray(genutils.cropQImage(qimage, [top, left, w, h]))
+            mask = np.zeros((h, w), dtype=np.uint8)
+            blob_mask = blob.getMask()
+            bt, bl = int(blob.bbox[0]) - top, int(blob.bbox[1]) - left
+            y0, x0 = max(0, bt), max(0, bl)
+            y1, x1 = min(h, bt + blob_mask.shape[0]), min(w, bl + blob_mask.shape[1])
+            if y1 > y0 and x1 > x0:
+                mask[y0:y1, x0:x1] = blob_mask[y0 - bt:y1 - bt, x0 - bl:x1 - bl]
+            jobs.append((blob, top, left, img, mask))
+
+        if self.ritm_refit is None:
+            self.ritm_refit = CarryOver.RitmRefit(self.taglab_dir)
+        ritm = self.ritm_refit
+
+        def work(progress, stop):
+            results = []
+            for i, (blob, top, left, img, mask) in enumerate(jobs):
+                if stop():
+                    break
+                refitted = ritm.refit(img, mask)
+                accepted, iou, ratio = CarryOver.acceptRefit(mask, refitted)
+                results.append((blob, top, left, refitted if accepted else None))
+                progress(100.0 * (i + 1) / len(jobs))
+            return results
+
+        try:
+            results, stopped = self.runInBackground("Re-fitting {:d} outline(s) with RITM..".format(len(jobs)), work)
+        except Exception as e:
+            logfile.error("[TOOL][MOVEREGION] Re-fit failed: " + str(e))
+            box = QMessageBox()
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("The outlines could not be re-fitted:\n" + str(e))
+            box.exec()
+            return 0
+
+        refitted_ids = []
+        for blob, top, left, new_mask in results:
+            if new_mask is None or viewer.annotations.blobById(blob.id) is not blob:
+                continue
+            new_blob = CarryOver.blobFromMask(new_mask, left, top)
+            if new_blob is None:
+                continue
+            new_blob.setId(blob.id)
+            new_blob.version = blob.version + 1
+            new_blob.class_name = blob.class_name
+            new_blob.instance_name = blob.instance_name
+            new_blob.note = blob.note
+            new_blob.genet = blob.genet
+            new_blob.data = {k: v for k, v in blob.data.items() if k not in DemMetrics.DEM_METRIC_NAMES}
+            new_blob.correspondence_to_check = blob.correspondence_to_check
+            viewer.updateBlob(blob, new_blob, selected=True, redraw=False)
+            refitted_ids.append(blob.id)
+
+        if len(refitted_ids) > 0:
+            viewer.saveUndo()
+            viewer.scene.invalidate()
+
+        logfile.info("[TOOL][MOVEREGION] Re-fit: {:d} of {:d} region(s) re-fitted {}.".format(
+            len(refitted_ids), len(blobs), refitted_ids))
+
+        if len(refitted_ids) < len(blobs):
+            txt = "{:d} of {:d} outline(s) re-fitted.".format(len(refitted_ids), len(blobs))
+            if stopped:
+                txt += "\n\nThe re-fit was stopped."
+            else:
+                txt += "\n\nThe others keep their outline: RITM found no outline that overlaps it enough " \
+                       "(at least {:.0f}%) with a similar area (x{:.1f} to x{:.1f}).".format(
+                           100 * CarryOver.MIN_REFIT_IOU, CarryOver.REFIT_AREA_RANGE[0], CarryOver.REFIT_AREA_RANGE[1])
+            box = QMessageBox()
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText(txt)
+            box.exec()
+
+        return len(refitted_ids)
 
     def load(self, filename):
         """

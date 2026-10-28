@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 from typing import Optional, List
@@ -5,7 +6,7 @@ from typing import Optional, List
 import numpy as np
 import cv2
 
-from PyQt5.QtCore import pyqtSignal, Qt, pyqtSlot, QPointF
+from PyQt5.QtCore import pyqtSignal, Qt, pyqtSlot, QPointF, QPoint, QRectF, QTimer
 from PyQt5.QtGui import QImage, QPen, QFont, QColor, QPainter, QPainterPath, QKeyEvent, QCloseEvent, QMouseEvent, \
     QWheelEvent
 from PyQt5.QtWidgets import QWidget, QHeaderView, QSizePolicy, QVBoxLayout, QLabel, QTableWidget, QTableView, \
@@ -14,6 +15,9 @@ from PyQt5.QtWidgets import QWidget, QHeaderView, QSizePolicy, QVBoxLayout, QLab
 
 from source.QtImageViewer import QtImageViewer
 from source import Alignment as AL
+from source.DemMetrics import DemReader
+
+logfile = logging.getLogger("tool-logger")
 
 
 def qimageToArray(qimg: QImage):
@@ -31,24 +35,30 @@ def qimageToArray(qimg: QImage):
 
 class ImagePyramid(object):
     """
-    Full resolution image (zero-copy view of the QImage) plus a few reduced versions, used to render quickly
-    any part of the map at any zoom level.
+    An image (zero-copy view of a QImage, or an array: BGRA, or float heights with NaN for no data) plus a few
+    reduced versions, used to render quickly any part of the map at any zoom level. The image may itself be a
+    reduced version of the map (e.g. the DEM shading): full_size is then the size of the map in pixels (width,
+    height), and render() always works in map pixels.
     """
 
-    def __init__(self, qimage: QImage):
-        self.qimage, base = qimageToArray(qimage)
-        self.height, self.width = base.shape[0], base.shape[1]
-        self.levels = [(1.0, 1.0, base)]
-        small = cv2.resize(base, (max(1, self.width // 4), max(1, self.height // 4)), interpolation=cv2.INTER_AREA)
+    def __init__(self, image, full_size=None):
+        if isinstance(image, QImage):
+            self.qimage, base = qimageToArray(image)
+        else:
+            self.qimage, base = None, np.ascontiguousarray(image)
+        bh, bw = base.shape[0], base.shape[1]
+        self.width, self.height = (bw, bh) if full_size is None else (int(full_size[0]), int(full_size[1]))
+        self.levels = [(bw / self.width, bh / self.height, base)]
+        small = cv2.resize(base, (max(1, bw // 4), max(1, bh // 4)), interpolation=cv2.INTER_AREA)
         self.levels.append((small.shape[1] / self.width, small.shape[0] / self.height, small))
         while max(small.shape[:2]) > 512:
             small = cv2.resize(small, (max(1, small.shape[1] // 2), max(1, small.shape[0] // 2)),
                                interpolation=cv2.INTER_AREA)
             self.levels.append((small.shape[1] / self.width, small.shape[0] / self.height, small))
 
-    def render(self, V, w, h):
+    def render(self, V, w, h, border_value=0):
         """
-        Render the image transformed by V (full-resolution pixels -> screen pixels) on a w x h buffer (BGRA).
+        Render the image transformed by V (map pixels -> screen pixels) on a w x h buffer.
         """
         z = math.hypot(V[0, 0], V[1, 0])
         sx, sy, arr = self.levels[0]
@@ -56,18 +66,19 @@ class ImagePyramid(object):
             if lx >= z and ly >= z:
                 sx, sy, arr = lx, ly, a
                 break
-        Vl = V.copy()
-        Vl[:, 0] = V[:, 0] / sx
-        Vl[:, 1] = V[:, 1] / sy
+        # pixel i of a level covers the map pixels [i / s, (i + 1) / s): its centre is at (i + 0.5) / s - 0.5
+        L = np.array([[1.0 / sx, 0.0, 0.5 / sx - 0.5], [0.0, 1.0 / sy, 0.5 / sy - 0.5]])
         flags = cv2.INTER_NEAREST if z / sx > 2.0 else cv2.INTER_LINEAR
-        return AL.warpArray(arr, Vl, w, h, border_value=0, flags=flags)
+        return AL.warpArray(arr, AL.composeMatrix(V, L), w, h, border_value=border_value, flags=flags)
 
 
 class AlignmentPreviewPane(QWidget):
     """
     Preview of the alignment: the reference image and the image to align (transformed with the current
-    transformation) are rendered on the CPU, only for the visible area, and combined (blend, difference or
-    checkerboard). Left-drag pans, the wheel zooms.
+    transformation) are rendered on the CPU, only for the visible area, and combined: blend, checkerboard, swipe
+    (the reference left of a divider that follows the mouse), flicker (the two maps in turn) or difference. The
+    height difference mode shows the heights of the aligned DEM minus the reference DEM (blue lower, red higher).
+    Left-drag pans, the wheel zooms.
     """
 
     viewChanged = pyqtSignal(float, float, float)  # center x, center y (reference pixels), zoom
@@ -75,8 +86,12 @@ class AlignmentPreviewPane(QWidget):
     BLEND = 0
     DIFFERENCE = 1
     CHECKERBOARD = 2
+    SWIPE = 3
+    FLICKER = 4
+    HEIGHT = 5
 
     BACKGROUND = (40, 40, 40)
+    MAX_ZOOM = 32.0
 
     def __init__(self, mode, parent=None):
         super(AlignmentPreviewPane, self).__init__(parent)
@@ -86,6 +101,9 @@ class AlignmentPreviewPane(QWidget):
         self.alpha = 0.5
         self.threshold = 32
         self.checkerSize = 64
+        self.flickerRate = 2            # changes per second
+        self.flickerMoving = False      # flicker: the image to align is shown now
+        self.swipeX = None              # swipe: screen x of the divider (None: the middle)
         self.ref: Optional[ImagePyramid] = None
         self.mov: Optional[ImagePyramid] = None
         self.M = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
@@ -98,12 +116,26 @@ class AlignmentPreviewPane(QWidget):
         self.pointIds = []
         self.showPoints = True
         self.lastPos = None
+        self.renderCache = None         # (key, rendered reference, rendered image to align)
+        self.qualityCells = []          # alignment check (AL.residualGrid), drawn over the images
+        self.qualityStale = False
+        self.qualityVisible = True
+        self.qualityHighlight = None    # index of the cell shown by "Worst"
+        self.heightDiff: Optional[ImagePyramid] = None  # heights of the aligned DEM minus the reference (m, NaN)
+        self.heightRange = 0.05         # height difference shown at full colour (m)
+        self.heightCache = None
         self.setCursor(Qt.OpenHandCursor)
+        self.setMouseTracking(True)
+
+        self.flickerTimer = QTimer(self)
+        self.flickerTimer.timeout.connect(self.flick)
 
     def setImages(self, ref: ImagePyramid, mov: ImagePyramid) -> None:
         self.ref = ref
         self.mov = mov
+        self.renderCache = None
         self.fitView()
+        self.updateTimer()
 
     def setTransform(self, M) -> None:
         self.M = np.asarray(M, dtype=np.float64)
@@ -121,25 +153,83 @@ class AlignmentPreviewPane(QWidget):
 
     def setMode(self, mode) -> None:
         self.mode = mode
+        self.updateTimer()
+        self.update()
+
+    def setParameter(self, mode, value) -> None:
+        """
+        The slider value of a mode: alpha (%), tile size (px), flicker rate (changes per second), threshold.
+        """
+        if mode == AlignmentPreviewPane.BLEND:
+            self.alpha = min(max(value / 100.0, 0.0), 1.0)
+        elif mode == AlignmentPreviewPane.CHECKERBOARD:
+            self.checkerSize = int(value)
+        elif mode == AlignmentPreviewPane.FLICKER:
+            self.flickerRate = max(1, int(value))
+            self.updateTimer()
+        elif mode == AlignmentPreviewPane.DIFFERENCE:
+            self.threshold = int(value)
+        elif mode == AlignmentPreviewPane.HEIGHT:
+            self.heightRange = max(1, int(value)) / 100.0
+        self.update()
+
+    def setHeightDifference(self, diff: Optional[ImagePyramid]) -> None:
+        """
+        :param: diff heights of the aligned DEM minus the reference DEM (m, NaN = no data), on the reference map
+        """
+        self.heightDiff = diff
+        self.heightCache = None
         self.update()
 
     def setAlpha(self, alpha: float) -> None:
-        self.alpha = min(max(alpha, 0.0), 1.0)
-        self.update()
+        self.setParameter(AlignmentPreviewPane.BLEND, 100.0 * alpha)
 
     def setThreshold(self, thr: int) -> None:
-        self.threshold = thr
-        self.update()
+        self.setParameter(AlignmentPreviewPane.DIFFERENCE, thr)
 
     def setCheckerSize(self, size: int) -> None:
-        self.checkerSize = size
-        self.update()
+        self.setParameter(AlignmentPreviewPane.CHECKERBOARD, size)
 
     def setPointsVisibility(self, visible: bool) -> None:
         self.showPoints = visible
         self.update()
 
-    def fitView(self) -> None:
+    def setQuality(self, cells, stale=False, highlight=None) -> None:
+        self.qualityCells = cells
+        self.qualityStale = stale
+        self.qualityHighlight = highlight
+        self.update()
+
+    def setQualityVisibility(self, visible: bool) -> None:
+        self.qualityVisible = visible
+        self.update()
+
+    # flicker ---------------------------------------------------------------------------------------------------------
+
+    def updateTimer(self) -> None:
+        if self.mode == AlignmentPreviewPane.FLICKER and self.isVisible() and self.ref is not None:
+            interval = int(round(1000.0 / self.flickerRate))
+            if not self.flickerTimer.isActive() or self.flickerTimer.interval() != interval:
+                self.flickerTimer.start(interval)
+        else:
+            self.flickerTimer.stop()
+
+    @pyqtSlot()
+    def flick(self) -> None:
+        self.flickerMoving = not self.flickerMoving
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super(AlignmentPreviewPane, self).showEvent(event)
+        self.updateTimer()
+
+    def hideEvent(self, event) -> None:
+        super(AlignmentPreviewPane, self).hideEvent(event)
+        self.updateTimer()
+
+    # view ------------------------------------------------------------------------------------------------------------
+
+    def fitView(self, notify=False) -> None:
         if self.ref is None:
             return
         w = max(1, self.width())
@@ -149,6 +239,8 @@ class AlignmentPreviewPane(QWidget):
         self.cx = self.ref.width / 2.0
         self.cy = self.ref.height / 2.0
         self.update()
+        if notify:
+            self.viewChanged.emit(self.cx, self.cy, self.zoom)
 
     def setView(self, cx: float, cy: float, zoom: float) -> None:
         self.cx = cx
@@ -156,9 +248,77 @@ class AlignmentPreviewPane(QWidget):
         self.zoom = zoom
         self.update()
 
+    def setZoom(self, zoom: float, notify=True) -> None:
+        """
+        Zoom around the center of the view (zoom = screen pixels per reference pixel).
+        """
+        self.zoom = min(max(zoom, self.minZoom), AlignmentPreviewPane.MAX_ZOOM)
+        self.update()
+        if notify:
+            self.viewChanged.emit(self.cx, self.cy, self.zoom)
+
+    def centerOn(self, x: float, y: float, zoom: Optional[float] = None) -> None:
+        self.cx = x
+        self.cy = y
+        if zoom is not None:
+            self.zoom = min(max(zoom, self.minZoom), AlignmentPreviewPane.MAX_ZOOM)
+        self.update()
+        self.viewChanged.emit(self.cx, self.cy, self.zoom)
+
     def viewMatrix(self):
         z = self.zoom
         return np.array([[z, 0.0, self.width() / 2.0 - self.cx * z], [0.0, z, self.height() / 2.0 - self.cy * z]])
+
+    # rendering -------------------------------------------------------------------------------------------------------
+
+    def renderImages(self):
+        """
+        The reference and the image to align rendered for the current view (BGRA); kept until the view or the
+        transformation changes (the swipe divider and the flicker only change how they are combined).
+        """
+        w = self.width()
+        h = self.height()
+        V = self.viewMatrix()
+        key = (w, h, V.tobytes(), self.M.tobytes(), id(self.ref), id(self.mov))
+        if self.renderCache is None or self.renderCache[0] != key:
+            ref = self.ref.render(V, w, h)
+            mov = self.mov.render(AL.composeMatrix(V, self.M), w, h)
+            # grey images (DEM shading)
+            if ref.ndim == 2:
+                ref = cv2.cvtColor(ref, cv2.COLOR_GRAY2BGRA)
+            if mov.ndim == 2:
+                mov = cv2.cvtColor(mov, cv2.COLOR_GRAY2BGRA)
+            self.renderCache = (key, ref, mov)
+        return self.renderCache[1], self.renderCache[2]
+
+    def renderHeight(self):
+        """
+        The height difference rendered for the current view (m, NaN = no data); kept until the view changes.
+        """
+        w = self.width()
+        h = self.height()
+        V = self.viewMatrix()
+        key = (w, h, V.tobytes(), id(self.heightDiff))
+        if self.heightCache is None or self.heightCache[0] != key:
+            self.heightCache = (key, self.heightDiff.render(V, w, h, border_value=np.nan))
+        return self.heightCache[1]
+
+    def composeHeight(self, out):
+        """
+        Height difference: white = same height, red = the aligned map is higher, blue = lower (full colour at
+        +/- heightRange).
+        """
+        if self.heightDiff is None:
+            return out
+        d = self.renderHeight()
+        valid = np.isfinite(d)
+        t = np.clip(d[valid] / self.heightRange, -1.0, 1.0)
+        fade = (255.0 * (1.0 - np.abs(t))).astype(np.uint8)
+        full = np.full(t.shape, 255, dtype=np.uint8)
+        out[valid, 0] = np.where(t < 0, full, fade)     # blue
+        out[valid, 1] = fade
+        out[valid, 2] = np.where(t > 0, full, fade)     # red
+        return out
 
     def compose(self):
         """
@@ -166,9 +326,16 @@ class AlignmentPreviewPane(QWidget):
         """
         w = self.width()
         h = self.height()
-        V = self.viewMatrix()
-        ref = self.ref.render(V, w, h)
-        mov = self.mov.render(AL.composeMatrix(V, self.M), w, h)
+        if self.mode == AlignmentPreviewPane.HEIGHT:
+            out = np.empty((h, w, 4), dtype=np.uint8)
+            out[:, :, 0] = self.BACKGROUND[2]
+            out[:, :, 1] = self.BACKGROUND[1]
+            out[:, :, 2] = self.BACKGROUND[0]
+            out = self.composeHeight(out)
+            out[:, :, 3] = 255
+            return out
+
+        ref, mov = self.renderImages()
 
         # valid pixels: inside the image and not black (no data)
         rv = (ref[:, :, 3] > 0) & (ref[:, :, :3].max(axis=2) > 0)
@@ -195,6 +362,19 @@ class AlignmentPreviewPane(QWidget):
             out[both, :3] = d[both][:, None]
             out[onlyR, :3] = (gr[onlyR] // 2)[:, None]
             out[onlyM, :3] = (gm[onlyM] // 2)[:, None]
+        elif self.mode == AlignmentPreviewPane.SWIPE:
+            x = self.swipePosition()
+            left = np.zeros((h, w), dtype=bool)
+            left[:, :x] = True
+            pickR = rv & left
+            pickM = mv & ~left
+            out[pickR] = ref[pickR]
+            out[pickM] = mov[pickM]
+        elif self.mode == AlignmentPreviewPane.FLICKER:
+            if self.flickerMoving:
+                out[mv] = mov[mv]
+            else:
+                out[rv] = ref[rv]
         else:
             # tiles anchored to the map (they do not move when panning)
             n = max(4, int(self.checkerSize))
@@ -211,6 +391,68 @@ class AlignmentPreviewPane(QWidget):
         out[:, :, 3] = 255
         return out
 
+    def swipePosition(self) -> int:
+        x = self.width() // 2 if self.swipeX is None else self.swipeX
+        return int(min(max(x, 0), self.width()))
+
+    def drawCaption(self, p: QPainter, text: str, y: int = 8) -> None:
+        p.setFont(QFont("Roboto", 10, QFont.Bold))
+        rect = p.fontMetrics().boundingRect(text).adjusted(-6, -3, 6, 3)
+        rect.moveTopLeft(QPoint(8, y))
+        p.fillRect(rect, QColor(0, 0, 0, 170))
+        p.setPen(Qt.white)
+        p.drawText(rect, Qt.AlignCenter, text)
+
+    QUALITY_COLORS = {AL.QUALITY_GOOD: (60, 200, 80), AL.QUALITY_FAIR: (240, 200, 40),
+                      AL.QUALITY_POOR: (235, 60, 50), AL.QUALITY_NONE: (150, 150, 150)}
+
+    def drawQuality(self, p: QPainter) -> None:
+        """
+        The cells of the alignment check: coloured by the residual (green / yellow / red, grey = not measurable),
+        with an arrow in the direction of the residual (its length grows with it).
+        """
+        V = self.viewMatrix()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setFont(QFont("Roboto", 8))
+        bounds = QRectF(self.rect())
+        for k, cell in enumerate(self.qualityCells):
+            x0, y0, x1, y1 = cell['rect']
+            (sx0, sy0), (sx1, sy1) = AL.applyMatrix(V, [[x0, y0], [x1, y1]]) + 0.5
+            rect = QRectF(QPointF(sx0, sy0), QPointF(sx1, sy1))
+            if not rect.intersects(bounds):
+                continue
+            color = QColor(*self.QUALITY_COLORS[cell['status']])
+            fill = QColor(color)
+            fill.setAlpha(25 if self.qualityStale else 55)
+            p.fillRect(rect.adjusted(1, 1, -1, -1), fill)
+            if k == self.qualityHighlight:
+                pen = QPen(Qt.white, 3)
+            else:
+                pen = QPen(color, 1, Qt.DashLine if self.qualityStale else Qt.SolidLine)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(rect.adjusted(1, 1, -1, -1))
+
+            if cell['mm'] is None:
+                continue
+            cx, cy = 0.5 * (sx0 + sx1), 0.5 * (sy0 + sy1)
+            if cell['mm'] >= 0.05:
+                length = min(0.45 * min(rect.width(), rect.height()), 6.0 + 8.0 * cell['mm'])
+                ux, uy = cell['dx_mm'] / cell['mm'], cell['dy_mm'] / cell['mm']
+                tip = QPointF(cx + ux * length, cy + uy * length)
+                p.setPen(QPen(color, 2))
+                p.drawLine(QPointF(cx, cy), tip)
+                for side in (1.0, -1.0):
+                    hx = -ux * 5.0 + side * -uy * 3.5
+                    hy = -uy * 5.0 + side * ux * 3.5
+                    p.drawLine(tip, QPointF(tip.x() + hx, tip.y() + hy))
+            if rect.width() > 70 and rect.height() > 40:
+                p.setPen(Qt.white)
+                p.drawText(QPointF(sx0 + 5, sy1 - 5), "{:.1f} mm".format(cell['mm']))
+
+        if self.qualityStale:
+            self.drawCaption(p, "Alignment check out of date", y=self.height() - 30)
+
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(*self.BACKGROUND))
@@ -222,10 +464,30 @@ class AlignmentPreviewPane(QWidget):
         img = QImage(out.data, out.shape[1], out.shape[0], out.strides[0], QImage.Format_RGB32)
         p.drawImage(0, 0, img)
 
+        if self.mode == AlignmentPreviewPane.SWIPE:
+            x = self.swipePosition()
+            p.setPen(QPen(QColor(255, 255, 255), 1))
+            p.drawLine(x, 0, x, self.height())
+            p.setPen(QPen(QColor(0, 0, 0), 1))
+            p.drawLine(x - 1, 0, x - 1, self.height())
+            self.drawCaption(p, "Reference | Aligned")
+        elif self.mode == AlignmentPreviewPane.FLICKER:
+            self.drawCaption(p, "Aligned" if self.flickerMoving else "Reference")
+        elif self.mode == AlignmentPreviewPane.HEIGHT:
+            if self.heightDiff is None:
+                self.drawCaption(p, "Height difference: both maps need a DEM")
+            else:
+                cm = self.heightRange * 100.0
+                self.drawCaption(p, "Aligned - reference heights: blue -{:g} cm, white 0, red +{:g} cm".format(cm, cm))
+
+        if self.qualityVisible and len(self.qualityCells) > 0:
+            self.drawQuality(p)
+
         if self.showPoints and len(self.refPoints) > 0:
+            # screen pixel j is drawn at [j, j+1): pixel centers are at +0.5
             V = self.viewMatrix()
-            r = AL.applyMatrix(V, self.refPoints)
-            m = AL.applyMatrix(AL.composeMatrix(V, self.M), self.movPoints)
+            r = AL.applyMatrix(V, self.refPoints) + 0.5
+            m = AL.applyMatrix(AL.composeMatrix(V, self.M), self.movPoints) + 0.5
             p.setRenderHint(QPainter.Antialiasing)
             p.setFont(QFont("Roboto", 9, QFont.Bold))
             for (a, b, ident) in zip(r, m, self.pointIds):
@@ -240,12 +502,17 @@ class AlignmentPreviewPane(QWidget):
                 p.drawText(QPointF(a[0] + 6, a[1] - 6), str(ident))
         p.end()
 
+    # mouse -----------------------------------------------------------------------------------------------------------
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
             self.lastPos = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self.mode == AlignmentPreviewPane.SWIPE:
+            self.swipeX = event.pos().x()
+            self.update()
         if self.lastPos is None:
             return
         d = event.pos() - self.lastPos
@@ -262,7 +529,7 @@ class AlignmentPreviewPane(QWidget):
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         f = math.pow(2.0, event.angleDelta().y() / 240.0)
-        newZoom = min(max(self.zoom * f, self.minZoom), 32.0)
+        newZoom = min(max(self.zoom * f, self.minZoom), AlignmentPreviewPane.MAX_ZOOM)
         # keep the point under the cursor fixed
         px = event.pos().x() - self.width() / 2.0
         py = event.pos().y() - self.height() / 2.0
@@ -273,6 +540,115 @@ class AlignmentPreviewPane(QWidget):
         self.cy = my - py / self.zoom
         self.update()
         self.viewChanged.emit(self.cx, self.cy, self.zoom)
+
+
+class PreviewModeControls(QWidget):
+    """
+    The mode list of a preview pane and the slider of its current mode (alpha, tile size, flicker rate, threshold);
+    each mode keeps its own slider value.
+    """
+
+    NAMES = {AlignmentPreviewPane.BLEND: "Blend",
+             AlignmentPreviewPane.CHECKERBOARD: "Checkerboard",
+             AlignmentPreviewPane.SWIPE: "Swipe",
+             AlignmentPreviewPane.FLICKER: "Flicker",
+             AlignmentPreviewPane.DIFFERENCE: "Difference",
+             AlignmentPreviewPane.HEIGHT: "Height difference"}
+
+    TOOLTIPS = {AlignmentPreviewPane.BLEND: "The two maps on top of each other (alpha: weight of the aligned map)",
+                AlignmentPreviewPane.CHECKERBOARD: "Tiles of the two maps in turn: features must continue across "
+                                                   "the tile borders",
+                AlignmentPreviewPane.SWIPE: "The reference left of the divider, the aligned map right of it: move "
+                                            "the mouse to move the divider",
+                AlignmentPreviewPane.FLICKER: "The two maps in turn: a shift shows up as a jump",
+                AlignmentPreviewPane.DIFFERENCE: "Gray-level difference (below the threshold: black)",
+                AlignmentPreviewPane.HEIGHT: "Heights of the aligned DEM minus the reference DEM (after the height "
+                                             "correction, if checked): blue lower, red higher; the slider sets the "
+                                             "range in cm"}
+
+    # mode: (minimum, maximum, default, label)
+    SLIDERS = {AlignmentPreviewPane.BLEND: (0, 100, 50, "Alpha: {:d}"),
+               AlignmentPreviewPane.CHECKERBOARD: (8, 512, 64, "Tile: {:d} px"),
+               AlignmentPreviewPane.FLICKER: (1, 8, 2, "Rate: {:d}/s"),
+               AlignmentPreviewPane.DIFFERENCE: (0, 255, 32, "Threshold: {:d}"),
+               AlignmentPreviewPane.HEIGHT: (1, 50, 5, "Range: +/-{:d} cm")}
+
+    HINTS = {AlignmentPreviewPane.SWIPE: "the divider follows the mouse"}
+
+    def __init__(self, pane: AlignmentPreviewPane, modes, mode, parent=None):
+        super(PreviewModeControls, self).__init__(parent)
+        self.pane = pane
+        self.values = {m: spec[2] for (m, spec) in self.SLIDERS.items()}
+
+        self.combo = QComboBox()
+        self.combo.setFocusPolicy(Qt.NoFocus)
+        self.label = QLabel()
+        self.label.setMinimumWidth(110)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimumWidth(80)
+        self.slider.setFocusPolicy(Qt.StrongFocus)
+        self.hint = QLabel()
+        self.hint.setStyleSheet("color: rgb(170,170,170)")
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.combo)
+        layout.addWidget(self.label)
+        layout.addWidget(self.slider)
+        layout.addWidget(self.hint)
+        layout.setStretchFactor(self.slider, 1)
+        self.setLayout(layout)
+
+        for (m, value) in self.values.items():
+            pane.setParameter(m, value)
+        self.setModes(modes, mode)
+        self.combo.currentIndexChanged[int].connect(self.modeChanged)
+        self.slider.valueChanged[int].connect(self.valueChanged)
+
+    def mode(self):
+        return self.combo.currentData()
+
+    def setModes(self, modes, mode=None) -> None:
+        """
+        Fill the mode list (the current mode is kept if still listed, else the given or the first one).
+        """
+        current = self.mode() if mode is None else mode
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        for m in modes:
+            self.combo.addItem(self.NAMES[m], m)
+            self.combo.setItemData(self.combo.count() - 1, self.TOOLTIPS.get(m, ""), Qt.ToolTipRole)
+        index = self.combo.findData(current)
+        self.combo.setCurrentIndex(index if index >= 0 else 0)
+        self.combo.blockSignals(False)
+        self.modeChanged()
+
+    @pyqtSlot(int)
+    def modeChanged(self, index=None) -> None:
+        mode = self.mode()
+        self.pane.setMode(mode)
+        spec = self.SLIDERS.get(mode)
+        self.slider.blockSignals(True)
+        if spec is not None:
+            self.slider.setRange(spec[0], spec[1])
+            self.slider.setValue(self.values[mode])
+            self.label.setText(spec[3].format(self.values[mode]))
+        self.slider.blockSignals(False)
+        self.label.setVisible(spec is not None)
+        self.slider.setVisible(spec is not None)
+        self.hint.setText(self.HINTS.get(mode, ""))
+        self.hint.setVisible(mode in self.HINTS)
+        self.combo.setToolTip(self.TOOLTIPS.get(mode, ""))
+
+    @pyqtSlot(int)
+    def valueChanged(self, value: int) -> None:
+        mode = self.mode()
+        spec = self.SLIDERS.get(mode)
+        if spec is None:
+            return
+        self.values[mode] = value
+        self.label.setText(spec[3].format(value))
+        self.pane.setParameter(mode, value)
 
 
 class MarkerObjData:
@@ -347,6 +723,12 @@ class QtAlignmentToolWidget(QWidget):
     ROT_STEP = 0.01      # degrees per slider tick
     TRA_STEP = 0.1       # millimeters per slider tick
 
+    PREVIEW_MODES = [AlignmentPreviewPane.BLEND, AlignmentPreviewPane.CHECKERBOARD, AlignmentPreviewPane.SWIPE,
+                     AlignmentPreviewPane.FLICKER, AlignmentPreviewPane.DIFFERENCE]
+    # the DEM shading of the map to align is lit from the same direction as the reference (in the reference frame):
+    # it is computed again if the rotation changes by more than this (degrees)
+    SHADE_TOLERANCE = 5.0
+
     def __init__(self, taglab_dir, project, parent=None):
         super(QtAlignmentToolWidget, self).__init__(parent)
 
@@ -379,6 +761,25 @@ class QtAlignmentToolWidget(QWidget):
         self.dTy = 0.0
         self.pyramids = {}
         self.updatingTable = False
+        self.quality = None             # last alignment check: cells, stats, pixel matrix and images measured
+        self.worstOrder = []            # measured cells, largest residual first ("Worst")
+        self.worstIndex = -1
+        self.hasDems = False            # both maps have a DEM: DEM shading, matching on the DEM, heights
+        self.shadePyramids = {}         # DEM shading of the maps of the current pair: image id -> (azimuth, pyramid)
+        self.heightData = None          # the two DEMs reduced to compare the heights: (reference, map to align)
+        self.heightPlane = None         # plane fitted to the height difference (AL.fitHeightPlane) ...
+        self.heightPlaneM = None        # ... with this pixel matrix
+        self.heightTimer = QTimer(self)
+        self.heightTimer.setSingleShot(True)
+        self.heightTimer.setInterval(300)
+        self.heightTimer.timeout.connect(self.__updateHeights)
+
+        # result of Confirm, used by TagLab when the tool closes: (original map, aligned copy, pixel matrix) to put in
+        # place of the original maps, the shift of the working area (reference extended) and the final message
+        self.replacements = []
+        self.workingAreaShift = None
+        self.resultMessage = ""
+        self.resultLog = ""
 
         # ==============================================================
         # Top buttons
@@ -395,6 +796,15 @@ class QtAlignmentToolWidget(QWidget):
         self.autoMarkersButton.setFixedHeight(20)
         self.autoMarkersButton.setToolTip("Find corresponding points automatically (feature matching)")
         self.autoMarkersButton.clicked.connect(self.onAutoMarkersRequested)
+
+        self.matchOnLabel = QLabel("Match on:")
+        self.matchCombo = QComboBox()
+        self.matchCombo.setFocusPolicy(Qt.NoFocus)
+        self.matchCombo.addItem("Colour", "colour")
+        self.matchCombo.addItem("DEM relief", "dem")
+        self.matchCombo.addItem("Colour + DEM", "both")
+        self.matchCombo.setToolTip("What Auto Markers compares: the colours, the relief of the DEMs (not affected by "
+                                   "colour changes such as bleaching, algae or light), or both")
 
         self.previewButton = QPushButton("Preview Alignment")
         self.previewButton.setFixedWidth(200)
@@ -441,6 +851,8 @@ class QtAlignmentToolWidget(QWidget):
         self.buttons.addWidget(self.backToEditButton)
         self.buttons.addWidget(self.clearMarkersButton)
         self.buttons.addWidget(self.autoMarkersButton)
+        self.buttons.addWidget(self.matchOnLabel)
+        self.buttons.addWidget(self.matchCombo)
         self.buttons.addWidget(self.resetTransfButton)
         self.buttons.addWidget(self.showMarkersCheck)
         self.buttons.addWidget(self.applyScaleCheck)
@@ -592,47 +1004,101 @@ class QtAlignmentToolWidget(QWidget):
         self.rightPreviewViewer = AlignmentPreviewPane(AlignmentPreviewPane.DIFFERENCE)
         self.leftPreviewViewer.viewChanged[float, float, float].connect(self.rightPreviewViewer.setView)
         self.rightPreviewViewer.viewChanged[float, float, float].connect(self.leftPreviewViewer.setView)
+        self.leftPreviewViewer.viewChanged[float, float, float].connect(self.previewViewChanged)
+        self.rightPreviewViewer.viewChanged[float, float, float].connect(self.previewViewChanged)
 
-        self.leftModeCombobox = QComboBox()
-        self.leftModeCombobox.addItem("Blend")
-        self.leftModeCombobox.addItem("Checkerboard")
-        self.leftModeCombobox.currentIndexChanged[int].connect(self.leftPreviewModeChanges)
+        # each pane has its own mode (Height difference is added when both maps have a DEM)
+        self.leftPreviewControls = PreviewModeControls(self.leftPreviewViewer, self.PREVIEW_MODES,
+                                                       AlignmentPreviewPane.BLEND)
+        self.rightPreviewControls = PreviewModeControls(self.rightPreviewViewer, self.PREVIEW_MODES,
+                                                        AlignmentPreviewPane.DIFFERENCE)
 
-        self.alphaSliderLabel = QLabel("Alpha: 50")
-        self.alphaSliderLabel.setMinimumWidth(110)
-        self.alphaSlider = makeSlider(0, 100, self.previewAlphaValueChanges)
-        self.alphaSlider.setValue(50)
+        # zoom
+        self.fitButton = QPushButton("Fit")
+        self.fitButton.setFixedWidth(60)
+        self.fitButton.setFixedHeight(20)
+        self.fitButton.setToolTip("Show the whole reference map")
+        self.fitButton.clicked.connect(self.onFitPreview)
+        self.oneToOneButton = QPushButton("1:1")
+        self.oneToOneButton.setFixedWidth(60)
+        self.oneToOneButton.setFixedHeight(20)
+        self.oneToOneButton.setToolTip("One pixel of the reference map per screen pixel")
+        self.oneToOneButton.clicked.connect(self.onOneToOnePreview)
+        self.zoomLabel = QLabel()
+        self.zoomLabel.setToolTip("Wheel or +/- keys: zoom; left drag: pan")
 
-        self.thresholdSliderLabel = QLabel("Threshold: 32")
-        self.thresholdSliderLabel.setMinimumWidth(110)
-        self.thresholdSlider = makeSlider(0, 255, self.thresholdValueChanges)
-        self.thresholdSlider.setValue(32)
+        # alignment check (quality map)
+        self.checkAlignmentButton = QPushButton("Check alignment")
+        self.checkAlignmentButton.setFixedWidth(130)
+        self.checkAlignmentButton.setFixedHeight(20)
+        self.checkAlignmentButton.setToolTip("Measure the shift left between the two maps on a grid of patches "
+                                             "(phase correlation): green <= {:g} mm, yellow <= {:g} mm, red more, "
+                                             "grey not measurable".format(AL.QUALITY_GOOD_MM, AL.QUALITY_FAIR_MM))
+        self.checkAlignmentButton.clicked.connect(self.onCheckAlignment)
+        self.worstButton = QPushButton("Worst ▶")
+        self.worstButton.setFixedWidth(80)
+        self.worstButton.setFixedHeight(20)
+        self.worstButton.setToolTip("Zoom on the cell with the largest shift left (press again for the next one)")
+        self.worstButton.setEnabled(False)
+        self.worstButton.clicked.connect(self.onWorstCell)
+        self.qualityCheck = QCheckBox("Quality map")
+        self.qualityCheck.setChecked(True)
+        self.qualityCheck.setFocusPolicy(Qt.NoFocus)
+        self.qualityCheck.stateChanged[int].connect(self.toggleQualityVisibility)
+        self.qualityLabel = QLabel()
+        self.qualityLabel.setWordWrap(True)
 
-        layoutAS = QHBoxLayout()
-        layoutAS.addWidget(self.leftModeCombobox)
-        layoutAS.addWidget(self.alphaSliderLabel)
-        layoutAS.addWidget(self.alphaSlider)
+        self.previewBar = QHBoxLayout()
+        self.previewBar.addWidget(self.fitButton)
+        self.previewBar.addWidget(self.oneToOneButton)
+        self.previewBar.addWidget(self.zoomLabel)
+        self.previewBar.addSpacing(30)
+        self.previewBar.addWidget(self.checkAlignmentButton)
+        self.previewBar.addWidget(self.worstButton)
+        self.previewBar.addWidget(self.qualityCheck)
+        self.previewBar.addWidget(self.qualityLabel)
+        self.previewBar.setStretchFactor(self.qualityLabel, 1)
 
-        layoutDIFF = QHBoxLayout()
-        layoutDIFF.addWidget(QLabel("Difference"))
-        layoutDIFF.addWidget(self.thresholdSliderLabel)
-        layoutDIFF.addWidget(self.thresholdSlider)
+        # DEM (both maps have one)
+        self.showLabel = QLabel("Show:")
+        self.showCombo = QComboBox()
+        self.showCombo.setFocusPolicy(Qt.NoFocus)
+        self.showCombo.addItem("Colour", "colour")
+        self.showCombo.addItem("DEM shading", "dem")
+        self.showCombo.setToolTip("Show the colours, or the shading of the two DEMs (light from the top left of the "
+                                  "reference); Check alignment measures what is shown")
+        self.showCombo.currentIndexChanged[int].connect(self.onShowChanged)
+        self.matchHeightsCheck = QCheckBox("Match DEM heights to the reference")
+        self.matchHeightsCheck.setChecked(True)
+        self.matchHeightsCheck.setFocusPolicy(Qt.NoFocus)
+        self.matchHeightsCheck.setToolTip("Remove the height offset and tilt between the two DEMs (a plane fitted to "
+                                          "the parts that did not change) when the aligned DEM is written")
+        self.matchHeightsCheck.stateChanged[int].connect(self.toggleMatchHeights)
+        self.heightLabel = QLabel()
+        self.heightLabel.setWordWrap(True)
+
+        self.demBar = QHBoxLayout()
+        self.demBar.addWidget(self.showLabel)
+        self.demBar.addWidget(self.showCombo)
+        self.demBar.addSpacing(30)
+        self.demBar.addWidget(self.matchHeightsCheck)
+        self.demBar.addWidget(self.heightLabel)
+        self.demBar.setStretchFactor(self.heightLabel, 1)
+        self.demPreviewWidgets = [self.showLabel, self.showCombo, self.matchHeightsCheck, self.heightLabel]
+        self.demEditWidgets = [self.matchOnLabel, self.matchCombo]
 
         self.previewLayoutL = QVBoxLayout()
-        self.previewLayoutL.addLayout(layoutAS)
+        self.previewLayoutL.addWidget(self.leftPreviewControls)
         self.previewLayoutL.addWidget(self.leftPreviewViewer)
         self.previewLayoutR = QVBoxLayout()
-        self.previewLayoutR.addLayout(layoutDIFF)
+        self.previewLayoutR.addWidget(self.rightPreviewControls)
         self.previewLayoutR.addWidget(self.rightPreviewViewer)
         self.previewLayout = QHBoxLayout()
         self.previewLayout.addLayout(self.previewLayoutL)
         self.previewLayout.addLayout(self.previewLayoutR)
-        self.previewOnlyWidgets = [self.leftModeCombobox, self.alphaSliderLabel, self.alphaSlider,
-                                   self.thresholdSliderLabel, self.thresholdSlider, self.leftPreviewViewer,
-                                   self.rightPreviewViewer]
-        for i in range(layoutDIFF.count()):
-            if layoutDIFF.itemAt(i).widget() is not None:
-                self.previewOnlyWidgets.append(layoutDIFF.itemAt(i).widget())
+        self.previewOnlyWidgets = [self.leftPreviewControls, self.rightPreviewControls, self.leftPreviewViewer,
+                                   self.rightPreviewViewer, self.fitButton, self.oneToOneButton, self.zoomLabel,
+                                   self.checkAlignmentButton, self.worstButton, self.qualityCheck, self.qualityLabel]
 
         # ==============================================================
         # Layout
@@ -642,6 +1108,8 @@ class QtAlignmentToolWidget(QWidget):
         content.addLayout(self.buttons)
         content.addLayout(self.layoutTop)
         content.addLayout(self.editLayout)
+        content.addLayout(self.previewBar)
+        content.addLayout(self.demBar)
         content.addLayout(self.previewLayout)
         self.setLayout(content)
 
@@ -662,6 +1130,12 @@ class QtAlignmentToolWidget(QWidget):
             self.hoveringMarker = None
             self.__deleteMarker(i)
             self.__markersChanged()
+
+        if self.isPreviewMode and event.key() in (Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus):
+            f = 0.5 if event.key() == Qt.Key_Minus else 2.0
+            self.leftPreviewViewer.setZoom(self.leftPreviewViewer.zoom * f)
+            event.accept()
+            return
 
         if event.modifiers() & Qt.ShiftModifier:
             self.rightImgViewer.disablePan()
@@ -730,6 +1204,13 @@ class QtAlignmentToolWidget(QWidget):
         self.markers = []
         self.hoveringMarker = None
         self.draggingMarker = None
+        # the fit of the previous pair must not be used with the markers of this one (before __refit)
+        self.fitRigid = self.fitScaled = None
+        self.baseMatrix = None
+        self.matrix = None
+        self.__resetQuality()
+        self.hasDems = image1.hasDEM() and image2.hasDEM()
+        self.__resetDem()
 
         self.leftImgViewer.setImg(channel1.qimage)
         self.leftImgViewer.px_to_mm = self.pxSizeL
@@ -799,12 +1280,16 @@ class QtAlignmentToolWidget(QWidget):
             return
         M = self.__previewMatrix()
         complete = [m for m in self.markers if m.isComplete() and m.enabled]
-        refPts = [[m.lViewPos.x() / self.pxSizeL, m.lViewPos.y() / self.pxSizeL] for m in complete]
-        movPts = [[m.rViewPos.x() / self.pxSizeR, m.rViewPos.y() / self.pxSizeR] for m in complete]
+        refPts = AL.mmToPixels([[m.lViewPos.x(), m.lViewPos.y()] for m in complete], self.pxSizeL)
+        movPts = AL.mmToPixels([[m.rViewPos.x(), m.rViewPos.y()] for m in complete], self.pxSizeR)
         ids = [m.identifier for m in complete]
         for pane in [self.leftPreviewViewer, self.rightPreviewViewer]:
             pane.setTransform(M)
             pane.setPoints(refPts, movPts, ids)
+        if self.quality is not None:
+            self.__showQuality()
+        if self.heightData is not None:
+            self.heightTimer.start()
 
     @pyqtSlot()
     def onPreviewRequested(self) -> None:
@@ -815,48 +1300,271 @@ class QtAlignmentToolWidget(QWidget):
                            "images, or use Auto Markers).")
             msgBox.exec()
             return
-        image1, image2 = self.__images()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            ref = self.__pyramid(self.__rgbChannel(image1).qimage)
-            mov = self.__pyramid(self.__rgbChannel(image2).qimage)
+            ref, mov = self.__previewPyramids()
+            if self.hasDems and self.heightData is None:
+                self.__loadHeights()
         finally:
             QApplication.restoreOverrideCursor()
         self.__togglePreviewMode(True)
         QApplication.processEvents()
-        self.leftPreviewViewer.setImages(ref, mov)
-        self.rightPreviewViewer.setImages(ref, mov)
+        self.__setPreviewImages(ref, mov, keepView=False)
         self.__updatePreview()
+        if self.heightData is not None:
+            self.heightTimer.stop()
+            self.__updateHeights()
+        self.previewViewChanged()
+
+    def __setPreviewImages(self, ref: ImagePyramid, mov: ImagePyramid, keepView=True) -> None:
+        left = self.leftPreviewViewer
+        view = (left.cx, left.cy, left.zoom) if keepView and left.ref is not None else None
+        for pane in [left, self.rightPreviewViewer]:
+            pane.setImages(ref, mov)
+        if view is not None:
+            left.setView(*view)
+        self.rightPreviewViewer.setView(left.cx, left.cy, left.zoom)
+
+    def __previewPyramids(self):
+        """
+        The images shown by the preview: the colours, or the shading of the DEMs (the map to align is lit from the
+        same direction as the reference, in the frame of the reference).
+        """
+        image1, image2 = self.__images()
+        if self.hasDems and self.showCombo.currentData() == "dem":
+            angle = AL.matrixToParams(self.matrix)[0] if self.matrix is not None else 0.0
+            return self.__shadePyramid(image1, AL.SHADE_AZIMUTH), \
+                self.__shadePyramid(image2, AL.SHADE_AZIMUTH - angle)
+        return self.__pyramid(self.__rgbChannel(image1).qimage), self.__pyramid(self.__rgbChannel(image2).qimage)
+
+    def __shadePyramid(self, image, azimuth: float) -> ImagePyramid:
+        """
+        Shading of the DEM of the map lit from azimuth, computed on the DEM reduced to at most AL.SHADE_MAX_SIDE
+        pixels a side; computed again only if the light changes by more than SHADE_TOLERANCE.
+        """
+        cached = self.shadePyramids.get(image.id)
+        if cached is not None and abs((cached[0] - azimuth + 180.0) % 360.0 - 180.0) <= self.SHADE_TOLERANCE:
+            return cached[1]
+        reader = DemReader(os.path.join(self.taglab_dir, image.getDEMChannel().filename), image.pixelSize())
+        try:
+            W, H = reader.dataset.width, reader.dataset.height
+            shape = AL.reducedShape(W, H, AL.SHADE_MAX_SIDE)
+            z = AL.readDem(reader.dataset, shape)
+            shade = AL.hillshade(z, reader.dx * W / shape[1], reader.dy * H / shape[0], azimuth)
+        finally:
+            reader.close()
+        pyramid = ImagePyramid(shade, full_size=(image.width, image.height))
+        self.shadePyramids[image.id] = (azimuth, pyramid)
+        return pyramid
+
+    @pyqtSlot(int)
+    def onShowChanged(self, index: int) -> None:
+        if not self.isPreviewMode:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ref, mov = self.__previewPyramids()
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.__setPreviewImages(ref, mov)
+
+    # ==================================================================================================================
+    # DEM heights
+    # ==================================================================================================================
+
+    def __resetDem(self) -> None:
+        """
+        A new pair of maps: no DEM shading or heights yet; the preview modes that need a DEM on both maps.
+        """
+        self.shadePyramids = {}
+        self.heightData = None
+        self.heightPlane = None
+        self.heightPlaneM = None
+        self.heightTimer.stop()
+        self.heightLabel.setText("")
+        self.showCombo.blockSignals(True)
+        self.showCombo.setCurrentIndex(0)
+        self.showCombo.blockSignals(False)
+        modes = self.PREVIEW_MODES + ([AlignmentPreviewPane.HEIGHT] if self.hasDems else [])
+        for controls in [self.leftPreviewControls, self.rightPreviewControls]:
+            controls.setModes(modes)
+            controls.pane.setHeightDifference(None)
+        for w in self.demEditWidgets:
+            w.setVisible(not self.isPreviewMode and self.hasDems)
+
+    def __loadHeights(self) -> None:
+        """
+        Read the two DEMs reduced to at most AL.HEIGHT_MAX_SIDE pixels a side, to compare their heights.
+        """
+        data = []
+        for image in self.__images():
+            reader = DemReader(os.path.join(self.taglab_dir, image.getDEMChannel().filename), image.pixelSize())
+            try:
+                ds = reader.dataset
+                data.append(AL.readDem(ds, AL.reducedShape(ds.width, ds.height, AL.HEIGHT_MAX_SIDE)))
+            finally:
+                reader.close()
+        self.heightData = (data[0], data[1])
+
+    def __updateHeights(self) -> None:
+        """
+        Compare the heights of the two DEMs with the current transformation: the plane fitted to their difference
+        (offset, tilt, spread) and the height difference shown by the preview (after the correction, if checked).
+        """
+        if self.heightData is None or self.matrix is None:
+            return
+        image1, image2 = self.__images()
+        M = self.__previewMatrix()
+        ref_size = (image1.width, image1.height)
+        diff = AL.heightDifference(self.heightData[0], self.heightData[1], M, ref_size, (image2.width, image2.height))
+        plane = AL.fitHeightPlane(diff, ref_size, self.pxSizeL)
+        self.heightPlane = plane
+        self.heightPlaneM = M.copy()
+        txt = AL.heightPlaneText(plane)
+        if plane is not None:
+            if self.matchHeightsCheck.isChecked():
+                diff = diff - AL.planeOnGrid(plane, diff.shape, ref_size)
+                txt += " Removed from the aligned DEM when you confirm."
+            else:
+                txt += " Not removed (the box is unchecked)."
+        pyramid = ImagePyramid(diff, full_size=ref_size)
+        for pane in [self.leftPreviewViewer, self.rightPreviewViewer]:
+            pane.setHeightDifference(pyramid)
+        self.heightLabel.setText(txt)
+
+    def __currentHeightPlane(self):
+        """
+        The height plane for the current transformation (None: no DEMs, or they do not overlap enough).
+        """
+        if not self.hasDems or self.matrix is None:
+            return None
+        if self.heightData is None:
+            self.__loadHeights()
+        M = self.__previewMatrix()
+        if self.heightPlaneM is None or not np.allclose(self.heightPlaneM, M, rtol=0.0, atol=1e-9):
+            self.heightTimer.stop()
+            self.__updateHeights()
+        return self.heightPlane
+
+    @pyqtSlot(int)
+    def toggleMatchHeights(self, value: int) -> None:
+        if self.heightData is not None and self.isPreviewMode:
+            self.__updateHeights()
 
     @pyqtSlot()
     def onBackToEditRequested(self) -> None:
         self.__togglePreviewMode(False)
 
-    @pyqtSlot(int)
-    def leftPreviewModeChanges(self, index: int) -> None:
-        if index == 0:
-            self.leftPreviewViewer.setMode(AlignmentPreviewPane.BLEND)
-            self.alphaSliderLabel.setText("Alpha: " + str(self.alphaSlider.value()))
-            self.alphaSlider.setRange(0, 100)
-            self.alphaSlider.setValue(50)
-        else:
-            self.leftPreviewViewer.setMode(AlignmentPreviewPane.CHECKERBOARD)
-            self.alphaSlider.setRange(8, 512)
-            self.alphaSlider.setValue(64)
+    @pyqtSlot()
+    def onFitPreview(self) -> None:
+        self.leftPreviewViewer.fitView(notify=True)
+
+    @pyqtSlot()
+    def onOneToOnePreview(self) -> None:
+        self.leftPreviewViewer.setZoom(1.0)
+
+    @pyqtSlot()
+    @pyqtSlot(float, float, float)
+    def previewViewChanged(self, cx=None, cy=None, zoom=None) -> None:
+        """
+        Show the zoom (screen pixels per pixel of the reference map) and the size of a screen pixel on the map.
+        """
+        zoom = self.leftPreviewViewer.zoom
+        self.zoomLabel.setText("Zoom {:.2f}x   ({:.3g} mm per screen pixel)".format(zoom, self.pxSizeL / zoom))
+
+    # ==================================================================================================================
+    # Alignment check (quality map)
+    # ==================================================================================================================
+
+    @pyqtSlot()
+    def onCheckAlignment(self) -> None:
+        """
+        Measure the shift left between the two maps with the current transformation (AL.residualGrid, on the
+        images shown by the preview) and show it over both panes.
+        """
+        pane = self.leftPreviewViewer
+        if self.matrix is None or pane.ref is None or pane.mov is None:
+            return
+        M = self.__previewMatrix()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            cells, stats = AL.residualGrid(pane.ref.levels[0][2], pane.mov.levels[0][2], M, self.pxSizeL,
+                                           (pane.ref.width, pane.ref.height), (pane.mov.width, pane.mov.height))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        source = "DEM shading" if self.hasDems and self.showCombo.currentData() == "dem" else None
+        self.quality = {'cells': cells, 'stats': stats, 'M': M.copy(), 'source': source}
+        measured = [k for (k, c) in enumerate(cells) if c['mm'] is not None]
+        self.worstOrder = sorted(measured, key=lambda k: -cells[k]['mm'])
+        self.worstIndex = -1
+        self.worstButton.setEnabled(len(self.worstOrder) > 0)
+        self.qualityCheck.setChecked(True)
+        self.__showQuality()
+
+        image1, image2 = self.__images()
+        logfile.info("[ALIGNMENT] '{}' on '{}': {}".format(image2.id, image1.id, AL.qualityText(stats, source)))
+
+    @pyqtSlot()
+    def onWorstCell(self) -> None:
+        """
+        Zoom the preview on the next cell with the largest residual.
+        """
+        if self.quality is None or len(self.worstOrder) == 0:
+            return
+        self.worstIndex = (self.worstIndex + 1) % len(self.worstOrder)
+        k = self.worstOrder[self.worstIndex]
+        cell = self.quality['cells'][k]
+        x0, y0, x1, y1 = cell['patch'] if cell['patch'] is not None else cell['rect']
+        pane = self.leftPreviewViewer
+        zoom = 0.6 * min(pane.width(), pane.height()) / max(x1 - x0, y1 - y0, 1.0)
+        self.__showQuality()
+        pane.centerOn(0.5 * (x0 + x1), 0.5 * (y0 + y1), zoom)
 
     @pyqtSlot(int)
-    def previewAlphaValueChanges(self, value: int) -> None:
-        if self.leftModeCombobox.currentIndex() == 0:
-            self.alphaSliderLabel.setText("Alpha: " + str(value))
-            self.leftPreviewViewer.setAlpha(value / 100.0)
-        else:
-            self.alphaSliderLabel.setText("Tile: " + str(value) + " px")
-            self.leftPreviewViewer.setCheckerSize(value)
+    def toggleQualityVisibility(self, value: int) -> None:
+        self.leftPreviewViewer.setQualityVisibility(value != 0)
+        self.rightPreviewViewer.setQualityVisibility(value != 0)
 
-    @pyqtSlot(int)
-    def thresholdValueChanges(self, value: int) -> None:
-        self.thresholdSliderLabel.setText("Threshold: " + str(value))
-        self.rightPreviewViewer.setThreshold(value)
+    def __qualityIsCurrent(self) -> bool:
+        """
+        True if the last alignment check was made with the current transformation.
+        """
+        return self.quality is not None and self.matrix is not None and \
+            np.allclose(self.quality['M'], self.__previewMatrix(), rtol=0.0, atol=1e-9)
+
+    def __qualitySummary(self) -> str:
+        if self.quality is None:
+            return "Alignment check: not done."
+        txt = AL.qualityText(self.quality['stats'], self.quality['source'])
+        if not self.__qualityIsCurrent():
+            txt += " (measured before the last change of the transformation)"
+        return txt
+
+    def __showQuality(self) -> None:
+        """
+        Show the last alignment check over both panes (marked out of date if the transformation has changed).
+        """
+        if self.quality is None:
+            for pane in [self.leftPreviewViewer, self.rightPreviewViewer]:
+                pane.setQuality([])
+            self.qualityLabel.setText("")
+            return
+        stale = not self.__qualityIsCurrent()
+        highlight = self.worstOrder[self.worstIndex] if self.worstIndex >= 0 else None
+        for pane in [self.leftPreviewViewer, self.rightPreviewViewer]:
+            pane.setQuality(self.quality['cells'], stale, highlight)
+        txt = AL.qualityText(self.quality['stats'], self.quality['source'])
+        if stale:
+            txt = "OUT OF DATE (the transformation has changed; press Check alignment again). " + txt
+        self.qualityLabel.setText(txt)
+
+    def __resetQuality(self) -> None:
+        self.quality = None
+        self.worstOrder = []
+        self.worstIndex = -1
+        self.worstButton.setEnabled(False)
+        self.__showQuality()
 
     def __togglePreviewMode(self, isPreviewMode: bool) -> None:
         self.isPreviewMode = isPreviewMode
@@ -870,6 +1578,10 @@ class QtAlignmentToolWidget(QWidget):
                   self.previewButton, self.autoMarkersButton, self.helpLabel, self.leftComboboxLabel,
                   self.leftCombobox, self.rightComboboxLabel, self.rightCombobox]:
             w.setVisible(not isPreviewMode)
+        for w in self.demPreviewWidgets:
+            w.setVisible(isPreviewMode and self.hasDems)
+        for w in self.demEditWidgets:
+            w.setVisible(not isPreviewMode and self.hasDems)
 
     # ==================================================================================================================
     # Manual adjustments
@@ -971,7 +1683,7 @@ class QtAlignmentToolWidget(QWidget):
     def __updateStats(self) -> None:
         usable = self.__usableMarkers()
         complete = [m for m in self.markers if m.isComplete()]
-        if self.matrix is None:
+        if self.matrix is None or len(usable) == 0:
             self.statsLabel.setText("Markers: {:d} complete, {:d} used.\nAt least 3 are needed to compute the "
                                     "alignment.".format(len(complete), len(usable)))
             return
@@ -1276,9 +1988,10 @@ class QtAlignmentToolWidget(QWidget):
     @pyqtSlot()
     def onAutoMarkersRequested(self) -> None:
         image1, image2 = self.__images()
+        mode = self.matchCombo.currentData() if self.hasDems else "colour"
         ch1 = image1.getRGBChannel()
         ch2 = image2.getRGBChannel()
-        if ch1 is None or ch2 is None:
+        if mode != "dem" and (ch1 is None or ch2 is None):
             box = QMessageBox()
             box.setText("Both images need an RGB channel.")
             box.exec()
@@ -1297,11 +2010,22 @@ class QtAlignmentToolWidget(QWidget):
             QApplication.processEvents()
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        refs, movs, keep = [], [], []
         try:
-            pairs, info = AL.autoMarkers(os.path.join(self.taglab_dir, ch1.filename),
-                                         os.path.join(self.taglab_dir, ch2.filename),
-                                         self.pxSizeL, self.pxSizeR, max_markers=30, progress=report)
+            if mode in ("colour", "both"):
+                # the colours come from the maps already loaded (only windows are converted)
+                for (image, channel, sources) in [(image1, ch1, refs), (image2, ch2, movs)]:
+                    qimage, array = qimageToArray(self.__rgbChannel(image).qimage)
+                    keep.append(qimage)
+                    sources.append(AL.ColourSource(os.path.join(self.taglab_dir, channel.filename), array))
+            if mode in ("dem", "both"):
+                for (image, px, sources) in [(image1, self.pxSizeL, refs), (image2, self.pxSizeR, movs)]:
+                    sources.append(AL.DemReliefSource(os.path.join(self.taglab_dir, image.getDEMChannel().filename),
+                                                      px))
+            pairs, info = AL.autoMarkers(refs, movs, self.pxSizeL, self.pxSizeR, max_markers=30, progress=report)
         except Exception as e:
+            for source in refs + movs:
+                source.close()
             QApplication.restoreOverrideCursor()
             progress.close()
             box = QMessageBox()
@@ -1310,6 +2034,8 @@ class QtAlignmentToolWidget(QWidget):
                         "\n\nPlace a few markers by hand (SHIFT + Left click).")
             box.exec()
             return
+        for source in refs + movs:
+            source.close()
         QApplication.restoreOverrideCursor()
         progress.close()
 
@@ -1318,16 +2044,46 @@ class QtAlignmentToolWidget(QWidget):
             self.markers.append(m)
         self.__markersChanged()
 
+        found = ""
+        if len(info['sources']) > 1:
+            found = " (" + ", ".join("{}: {:d}".format(name, n) for (name, n) in info['sources'].items()) + ")"
+        elif mode == "dem":
+            found = " (on the DEM relief)"
         box = QMessageBox()
         box.setWindowTitle("Auto Markers")
-        box.setText("{:d} markers have been added ({:d} feature matches, {:d} consistent).\n"
+        box.setText("{:d} markers have been added{} ({:d} feature matches, {:d} consistent).\n"
                     "Check the table: markers with a large error are shown in red, uncheck or delete them.".format(
-                        info['markers'], info['matches'], info['inliers']))
+                        info['markers'], found, info['matches'], info['inliers']))
         box.exec()
+        logfile.info("[ALIGNMENT] Auto Markers on '{}' / '{}' ({}): {:d} markers{}, {:d} matches, {:d} consistent."
+                     .format(image1.id, image2.id, mode, info['markers'], found, info['matches'], info['inliers']))
 
     # ==================================================================================================================
     # Confirm
     # ==================================================================================================================
+
+    def askConfirmation(self, text, extendChoice):
+        """
+        Ask to proceed. With extendChoice the reference has to be extended to the left/top: the answer is "extend",
+        "crop" or None (cancel); otherwise it is "yes" or None.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("Alignment Tool")
+        box.setText(text)
+        if extendChoice:
+            extend = box.addButton("Extend the reference", QMessageBox.AcceptRole)
+            crop = box.addButton("Crop to the reference", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(extend)
+            box.exec()
+            if box.clickedButton() is extend:
+                return "extend"
+            if box.clickedButton() is crop:
+                return "crop"
+            return None
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        return "yes" if box.exec() == QMessageBox.Yes else None
 
     @pyqtSlot()
     def onConfirmAlignment(self) -> None:
@@ -1343,33 +2099,78 @@ class QtAlignmentToolWidget(QWidget):
 
         M0 = AL.pixelMatrix(self.matrix, self.pxSizeL, self.pxSizeR)
         canvas = AL.unionCanvas(M0, mov_w, mov_h, ref_w, ref_h)
-        left, top = canvas['left'], canvas['top']
-        needRef = left > 0 or top > 0
+        needRef = canvas['left'] > 0 or canvas['top'] > 0
         appliedScale = AL.matrixToParams(self.matrix)[1] * 1.0
         scaleApplied = self.applyScaleCheck.isChecked()
 
         suffix2 = AL.uniqueSuffix(self.project, image2, "_coreg", self.taglab_dir)
         suffix1 = AL.uniqueSuffix(self.project, image1, "_ref", self.taglab_dir) if needRef else None
 
-        txt = "The image '{}' will be aligned to '{}' and added to the project as '{}' ({} x {} pixels, " \
-              "pixel size {:.4f} mm).".format(image2.name, image1.name, image2.id + suffix2, canvas['width'],
-                                              canvas['height'], self.pxSizeL)
-        if needRef:
-            txt += "\n\nThe canvas extends beyond the left/top side of the reference, so a padded copy of the " \
-                   "reference, '{}', is also created (shifted by {} px right, {} px down).".format(
-                        image1.id + suffix1, left, top)
-        txt += "\n\nScale: " + ("the fitted scale is applied (measured areas of the aligned image change)."
+        txt = "'{}' will be aligned to '{}'. The aligned map replaces '{}' in the project (same name); its image " \
+              "files are new files with the suffix '{}' ({} x {} pixels, pixel size {:.4f} mm). The original files " \
+              "are not changed.".format(image2.name, image1.name, image2.name, suffix2,
+                                        canvas['width'], canvas['height'], self.pxSizeL)
+        txt += "\n\nScale: " + ("the fitted scale is applied (measured areas of the aligned map change)."
                                 if scaleApplied else "not applied.")
-        txt += "\nRegions and points are transformed. Annotation grids and shape layers are not copied."
-        txt += "\n\nProceed?"
-        reply = QMessageBox.question(self, "Alignment Tool", txt, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        txt += "\nRegions and points are transformed, and the matches with the other years are kept."
+        txt += "\n\n" + self.__qualitySummary()
+
+        # heights of the DEM
+        plane = None
+        heightsTxt = None
+        if self.hasDems:
+            if self.matchHeightsCheck.isChecked():
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    plane = self.__currentHeightPlane()
+                finally:
+                    QApplication.restoreOverrideCursor()
+                if plane is None:
+                    heightsTxt = "DEM heights: not changed. " + AL.heightPlaneText(None)
+                else:
+                    heightsTxt = "DEM h" + AL.heightPlaneText(plane)[1:] + " This offset and tilt are removed from the " \
+                                 "aligned DEM; the DEM metrics and surface areas of its regions are cleared (compute " \
+                                 "them again from the DEM menu)."
+            else:
+                heightsTxt = "DEM heights: not changed (Match DEM heights is unchecked)."
+            txt += "\n\n" + heightsTxt
+        lost = AL.notCarriedOver(image2)
+        if len(lost) > 0:
+            txt += "\nNot carried over to the aligned map: " + ", ".join(lost) + "."
+
+        if needRef:
+            others = [im.name for im in self.project.images if im is not image1 and im is not image2]
+            txt += "\n\nThe aligned map extends beyond the left/top edge of the reference ({} px to the left, " \
+                   "{} px above). You can:".format(canvas['left'], canvas['top'])
+            txt += "\n\n- Extend the reference: '{}' is also replaced by a copy extended by that amount (an exact " \
+                   "shift: its regions move with it; new files with the suffix '{}'). The working area is shifted " \
+                   "too.".format(image1.name, suffix1)
+            lost1 = AL.notCarriedOver(image1)
+            if len(lost1) > 0:
+                txt += " Not carried over to the extended reference: " + ", ".join(lost1) + "."
+            if len(others) > 0:
+                txt += "\n  The other maps of the project ({}) are not shifted: if they were aligned to '{}', " \
+                       "they will be offset by the same amount and must be aligned again.".format(
+                            ", ".join("'" + name + "'" for name in others), image1.name)
+            txt += "\n\n- Crop to the reference: the aligned map is cut at the left/top edge of the reference, " \
+                   "nothing else changes."
+        else:
+            txt += "\n\nProceed?"
+
+        choice = self.askConfirmation(txt, needRef)
+        if choice is None:
             return
+        extend = choice == "extend"
+        if needRef and not extend:
+            # cropped at the left/top edge of the reference: the canvas only grows to the right and down
+            canvas = {'left': 0, 'top': 0, 'right': canvas['right'], 'bottom': canvas['bottom'],
+                      'width': ref_w + canvas['right'], 'height': ref_h + canvas['bottom']}
+        left, top = canvas['left'], canvas['top']
 
         M = AL.pixelMatrix(self.matrix, self.pxSizeL, self.pxSizeR, (left, top))
         crs, geoTransform = AL.georeferenceOfCanvas(image1.georef_filename, left, top)
 
-        nimages = 2 if needRef else 1
+        nimages = 2 if extend else 1
         progress = QProgressDialog("Aligning..", None, 0, 100, self)
         progress.setWindowTitle("Alignment Tool")
         progress.setWindowModality(Qt.WindowModal)
@@ -1385,17 +2186,19 @@ class QtAlignmentToolWidget(QWidget):
             return cb
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        created = []
+        replacements = []
         try:
             cpy2 = AL.createTransformedImage(image2, suffix2, M, canvas['width'], canvas['height'], crs, geoTransform,
                                              self.pxSizeL, self.taglab_dir,
-                                             appliedScale if scaleApplied else 1.0, report(0))
-            created.append(cpy2)
-            if needRef:
+                                             appliedScale if scaleApplied else 1.0, report(0),
+                                             height_plane=AL.shiftedPlane(plane, left, top) if plane is not None
+                                             else None)
+            replacements.append((image2, cpy2, M))
+            if extend:
                 T = np.array([[1.0, 0.0, float(left)], [0.0, 1.0, float(top)]])
                 cpy1 = AL.createTransformedImage(image1, suffix1, T, canvas['width'], canvas['height'], crs,
                                                  geoTransform, self.pxSizeL, self.taglab_dir, 1.0, report(1))
-                created.append(cpy1)
+                replacements.append((image1, cpy1, T))
         except Exception as e:
             QApplication.restoreOverrideCursor()
             progress.close()
@@ -1407,18 +2210,32 @@ class QtAlignmentToolWidget(QWidget):
         QApplication.restoreOverrideCursor()
         progress.close()
 
-        for im in created:
-            self.project.addNewImage(im, sort=False)
+        # the markers are stored for the original maps: TagLab moves them into the frames of the copies
         self.__storeMarkers()
-        self.project.orderImagesByAcquisitionDate()
+        self.replacements = replacements
+        self.workingAreaShift = (left, top) if extend else None
 
-        txt = "Added to the project: " + ", ".join("'" + im.id + "'" for im in created) + ".\n" \
-              "The new image files are next to the original ones.\n\nRemember to save the project (File > Save)."
-        if needRef and self.project.working_area is not None:
-            txt += "\n\nNote: the working area refers to the original reference; for the new images it must be " \
-                   "shifted by {} px right and {} px down.".format(left, top)
-        box = QMessageBox()
-        box.setWindowTitle("Alignment Tool")
-        box.setText(txt)
-        box.exec()
+        files = ", ".join(os.path.basename(ch.filename) for (old, new, _) in replacements for ch in new.channels)
+        txt = "'{}' has been aligned to '{}'.".format(image2.name, image1.name)
+        if extend:
+            txt += " '{}' has been extended by {} px to the left and {} px above.".format(image1.name, left, top)
+        txt += "\n\nThe project now uses the new image files ({}). The original files are unchanged (they are no " \
+               "longer part of the project once you save it).".format(files)
+        if extend and self.project.working_area is not None:
+            txt += "\n\nThe working area has been shifted by {} px right and {} px down.".format(left, top)
+        if plane is not None:
+            txt += "\n\nThe heights of the aligned DEM now match the reference (offset {:+.1f} cm and tilt {:.2f}° " \
+                   "removed). Compute the DEM metrics and surface areas of its regions again (DEM menu).".format(
+                       plane['offset'] * 100.0, plane['tilt'])
+        txt += "\n\nRemember to save the project (File > Save)."
+        self.resultMessage = txt
+        errors = [m.error for m in self.markers if m.isComplete() and m.enabled and m.error is not None]
+        rmse = math.sqrt(sum(e * e for e in errors) / len(errors)) if len(errors) > 0 else float('nan')
+        self.resultLog = "'{}' aligned to '{}' (markers rmse {:.3f} mm, {}{}), files: {}. {}".format(
+            image2.id, image1.id, rmse,
+            "scale applied" if scaleApplied else "no scale",
+            ", reference extended by ({}, {}) px".format(left, top) if extend else
+            (", cropped to the reference" if needRef else ""), files, self.__qualitySummary())
+        if heightsTxt is not None:
+            self.resultLog += " " + heightsTxt
         self.close()

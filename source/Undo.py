@@ -47,6 +47,23 @@ class Undo(object):
             self.operations.pop(0)
         self.position = len(self.operations) - 1
 
+    def mergePendingIntoLast(self):
+        """
+        Merge the pending step into the last saved one, which must be the current undo position (e.g. a region moved
+        again with the arrow keys: one undo step for all the moves). The regions the pending step removes were
+        added by the last step: they just disappear from it, and its saved matches (those of the original regions)
+        are kept.
+        """
+        last = self.operations[self.position]
+        pending = self.operation
+        added_by_last = set(id(b) for b in last['remove'])
+        removed_now = set(id(b) for b in pending['add'])
+        last['remove'] = [b for b in last['remove'] if id(b) not in removed_now] + pending['remove']
+        last['add'] = last['add'] + [b for b in pending['add'] if id(b) not in added_by_last]
+        last['class'] = last['class'] + pending['class']
+        last['newclass'] = last['newclass'] + pending['newclass']
+        self.operation = { 'remove':[], 'add':[], 'class':[], 'newclass':[] }
+
     def undo(self):
         if len(self.operations) == 0:
             return None

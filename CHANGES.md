@@ -21,6 +21,8 @@ under the same GPL-3 licence. It changes the following.
     matching" below).
 - **Opening a project:** loading a second project in the same session could fail with "connection is not unique".
 - **Custom attributes:** looking at a colony in the info panel no longer rounds its stored values.
+- **Region names:** editing a region (Edit Border, merge, subtract, dilate, erode, crack and others) no longer resets
+  its name.
 
 ## DEM and surface area
 - **Surface area:**
@@ -81,11 +83,59 @@ under the same GPL-3 licence. It changes the following.
   markers.
 - **Map edges:** maps are no longer cut at the edges, and the result keeps every pixel of both maps.
 - **Speed:** it is much faster and uses far less memory (about 2 GB instead of about 30 GB on large maps).
-- **Auto Markers:** finds corresponding points between the two maps automatically.
+- **Auto Markers:** finds corresponding points between the two maps automatically. It reads only the parts of the
+  maps it needs, so it uses much less memory on large maps.
 - **Scale:** it can estimate and (optionally) apply the scale difference between two surveys.
-- **New preview:** blend, difference and checkerboard views, at full resolution.
 - **Markers:** they are saved with the project.
 - **DEMs:** they keep their no-data areas, and georeferencing is preserved.
+- **Half a pixel:** markers placed by hand were counted from the pixel corners, while Auto Markers and the written
+  maps used the pixel centres. With rotation or different pixel sizes, the result could be off by up to half a pixel.
+  Everything now uses the same convention.
+- **The aligned map replaces the original in the project** (Confirm):
+  - It keeps the original's name and id, so colony names (e.g. `2014:45`), comparison tables, genets and exports stay
+    the same. Only its files are new (suffix `_coreg`). The original files stay on disk; the project stops using
+    them once you save it.
+  - The comparison tables (areas recomputed), the "to check" marks and the alignment markers move to the new map,
+    so the Alignment Tool can reopen the pair.
+  - Grids, shape layers, sampling areas and the dataset export area are not carried over; the confirmation lists the
+    ones the map has.
+  - When the aligned map reaches beyond the left or top edge of the reference, Confirm asks what to do:
+    - **Extend the reference:** the reference is replaced by a copy padded on that side (an exact shift: its colonies
+      move with it; suffix `_ref`), and the working area is shifted too. The other maps of the project are not
+      shifted, and the message lists them (re-align them if they were aligned to the reference).
+    - **Crop to the reference:** the aligned map is cut at the reference's edge; nothing else changes.
+    - **Cancel.**
+  - Nothing is saved automatically.
+- **Checking the alignment in the preview:**
+  - **Views** (a list in each pane): Blend, Checkerboard, **Swipe** (the reference left of a line that follows the
+    mouse, the aligned map right of it), **Flicker** (the two maps in turn, 1–8 times a second: a shift shows as a
+    jump) and Difference.
+  - **Zoom:** Fit and 1:1 buttons, `+` / `−` keys, and a label with the zoom and the mm per screen pixel.
+- **Check alignment** (button in the preview): measures what is left of the misalignment on a grid of about 12 × 12
+  cells over the overlap.
+  - Each cell is coloured green (≤ 1 mm), yellow (≤ 3 mm), red (> 3 mm) or grey (not measurable: no texture, no
+    data, or the place changed), with an arrow showing the direction.
+  - The label gives the median, 90% and worst values in mm. When most cells point the same way, it says how far the
+    aligned map sits from the reference, and that you can fix it with the markers or with Adjust Tx / Ty.
+  - **Worst ▶** zooms on the worst cell, then the next worst. **Quality map** shows or hides the cells.
+  - The result is marked out of date when the alignment changes.
+  - The result is written to `TagLab.log` and included in the Confirm summary.
+  - It takes a few seconds.
+- **Using the DEM** (when both maps have one):
+  - **Show: Colour / DEM shading** in the preview. Both DEMs are shaded with the same light (the light follows the
+    rotation of the aligned map). Every view, and Check alignment, can then use the shading.
+  - **Auto Markers "Match on": Colour / DEM relief / Colour + DEM.** The DEM relief (the height of each spot above
+    its surroundings) shows the shapes of the colonies whatever their colour: it still works after bleaching, algae
+    growth or a change of light, where the colour fails.
+  - **Heights:** TagLab compares the two DEMs and fits the difference with a tilted plane, leaving out the places
+    that changed (colonies that grew or disappeared). The label gives the height offset (cm), the tilt (°) and the
+    spread that is left (mm).
+  - **"Match DEM heights to the reference"** (on by default): the offset and the tilt are removed from the aligned
+    DEM when it is written. The DEM metrics and surface areas of its colonies are then cleared: compute them again
+    from the DEM menu.
+  - **Height difference view:** aligned minus reference heights, in blue (lower), white (same) and red (higher). Its
+    slider sets the colour range in cm. It shows whether the heights match, and where colonies grew or disappeared.
+- **Fix:** changing the pair of maps after an alignment had been computed could give an error.
 
 ## Carry Regions Over (Compare > Carry Regions Over…)
 Annotates a new timepoint from the previous one. The two maps must already be aligned, for example with the
@@ -111,6 +161,9 @@ Alignment Tool.
   - **N / P:** next or previous colony.
   - **K:** keep it.
   - **Delete:** remove it; it becomes "dead" in the comparison table.
+  - **Move (drag / arrows):** selects the colony and switches to the Move Region tool, to drag it onto the right spot.
+  - **Re-fit outline:** fits the outline of the colony to the image again (RITM), e.g. after moving it.
+  - Moving or re-fitting doesn't change the colony's status: press K to keep it.
   - You can also redraw it or change its class. Compare > Review Carried-over Colonies reopens the list.
 - **Tests on the official 2013–2014 sample:**
   - About three quarters of the surviving colonies came out `ok`.
@@ -214,9 +267,28 @@ the CoralNet website or with the CoralNet Toolbox).
   - Export CoralNet Point Annotations no longer writes Label, Row, Column and Name into the points' saved data.
   - Error messages printed after the CoralNet Toolbox was closed went to its closed window.
 
+## Move Region tool (toolbar button "Move region")
+Moves colonies that are in the wrong place, for example after Carry Regions Over.
+- **Shift + drag** a region to move it. A region that is not selected is selected first; dragging a selected one
+  moves the whole selection. A plain drag still pans the map.
+- **Arrow keys** move the selected regions by 1 pixel, **Shift + arrow** by 10 pixels.
+- **Esc** cancels a drag in progress.
+- Regions move by whole pixels, so their area and perimeter don't change, and they can't leave the map.
+- They keep their id, so their matches in the comparison tables and their genets stay. Class, name, note, custom
+  attributes and the "to check" mark stay too. Surface area and DEM metrics are cleared, because they were measured
+  at the old place.
+- **Space** re-fits the outlines of the selected regions to the image at their new place (RITM, with the old outline
+  as the start). A new outline is used only if it is close to the old one (the same rule as Carry Regions Over);
+  otherwise the moved outline is kept, and a message says how many outlines were re-fitted.
+- **Undo:** one step per drag, per series of arrow presses on the same regions, and per re-fit.
+
 ## Rotate Map (Project > Rotate Map…)
-- Creates a rotated copy of a map: 90°, 180° and 270° are exact, or you can enter any angle.
+- Rotates a map: 90°, 180° and 270° are exact, or you can enter any angle.
 - The DEM, the colonies, the points and the georeferencing are rotated too.
+- **The rotated map replaces the original in the project.** It keeps the original's name and id, so colony names,
+  comparison tables and exports stay the same; only its files are new (suffix `_rot90`, `_rot180`, …). The original
+  files stay on disk, and the project stops using them once you save it. The comparison tables, the "to check" marks
+  and the alignment markers move to the rotated map. Remember to save the project.
 
 ## Dictionaries
 - **`spongenursery.json`** (in the main folder, next to `FDEP.json`): the sponge nursery labels.

@@ -22,6 +22,7 @@ from source.tools.SelectPoints import SelectPoints
 from source.tools.SelectArea import SelectArea
 from source.tools.Ritm import Ritm
 from source.tools.PlaceAnnPoint import PlaceAnnPoint
+from source.tools.MoveRegion import MoveRegion
 
 from PyQt5.QtCore import Qt, QObject, QPointF, QRectF, QFileInfo, QDir, pyqtSlot, pyqtSignal, QT_VERSION_STR
 
@@ -83,6 +84,7 @@ class Tools(QObject):
             "SELECTAREA": SelectArea(self.viewerplus, self.pick_points),
             "RITM": Ritm(self.viewerplus, self.corrective_points),
             "ROWS": Rows(self.viewerplus),
+            "MOVEREGION": MoveRegion(self.viewerplus),
         }
         if self.SAM_is_available:   #just if SAM is available
             self.tools["SAM"] = Sam(self.viewerplus, self.pick_points)
@@ -117,6 +119,7 @@ class Tools(QObject):
         self.tools["SELECTAREA"].reset()
         self.tools["WATERSHED"].reset()
         self.tools["ROWS"].reset()
+        self.tools["MOVEREGION"].reset()
         if self.SAM_is_available:
             self.tools["SAM"].reset()
             self.tools["SAMINTERACTIVE"].reset()

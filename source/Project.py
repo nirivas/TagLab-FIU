@@ -519,6 +519,49 @@ class Project(QObject):
         if image.id in self.markers:
             del self.markers[image.id]
 
+    def replaceImage(self, old, new, M):
+        """
+        Put the transformed copy new (Rotate Map, Alignment Tool) in place of the map old: same position in the list,
+        same id and name (only its files differ), so the comparison tables, the colony names and the exports go on
+        referring to it. M maps the pixels of old to the pixels of new; the regions of new are the regions of old
+        transformed by M, with the same ids.
+        """
+        index = self.images.index(old)
+        new.id = old.id
+        new.name = old.name
+        self.images[index] = new
+
+        # what the copy of the regions does not carry: the "to check" marks and the next free id
+        to_check = set(blob.id for blob in old.annotations.seg_blobs if blob.correspondence_to_check)
+        for blob in new.annotations.seg_blobs:
+            if blob.id in to_check:
+                blob.correspondence_to_check = True
+        new.annotations.next_id = max(new.annotations.next_id, old.annotations.next_id)
+
+        tables = []
+        for corr in (self.correspondences or {}).values():
+            if corr.source is old or corr.target is old:
+                if corr.source is old:
+                    corr.source = new
+                if corr.target is old:
+                    corr.target = new
+                tables.append(corr)
+
+        # the markers involving the map, moved into the frame of the copy
+        from source.Alignment import transformMarkerPositions
+        px_old = old.pixelSize()
+        px_new = new.pixelSize()
+        for ref_id, entries in self.markers.items():
+            for coreg_id, entry in entries.items():
+                for side, img_id in (("ref", ref_id), ("coreg", coreg_id)):
+                    positions = entry["markers"][side]
+                    if img_id != old.id or len(positions) == 0:
+                        continue
+                    moved = transformMarkerPositions([[p["x"], p["y"]] for p in positions], M, px_old, px_new)
+                    entry["markers"][side] = [{"x": float(x), "y": float(y)} for (x, y) in moved]
+
+        self.finishTablesUpdate(tables)
+
     def findCorrespondences(self, image):
 
         corresps = list(filter(lambda i, image=image: i.source == image or i.target == image,

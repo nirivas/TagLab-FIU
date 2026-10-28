@@ -21,7 +21,7 @@ from PyQt5.QtGui import QImage
 from rasterio.transform import Affine
 from skimage import measure
 
-from source.Alignment import applyMatrix, composeMatrix
+from source.Alignment import applyMatrix, composeMatrix, phaseShift
 from source.Blob import Blob
 from source.DemMetrics import DemReader, DEM_METRIC_NAMES
 from source.genutils import cropQImage, qimageToNumpyArray
@@ -130,55 +130,7 @@ def reducedGray(qimage, max_side):
     return gray, rw / w, rh / h
 
 
-def phaseShift(a, b, valid):
-    """
-    Phase correlation of two images of the same size, using only the valid pixels. It returns (dx, dy, response):
-    the content at (x, y) of a is at (x + dx, y + dy) of b. The response is the sum of the correlation around the
-    peak, as cv2.phaseCorrelate gives it (1 = identical images).
-
-    cv2.phaseCorrelate is not used: it pads the images to an "optimal" DFT size, and when that size is odd the
-    shift it returns is off by half a pixel.
-    """
-    h, w = a.shape
-    if h < 8 or w < 8 or valid.sum() < 16:
-        return 0.0, 0.0, 0.0
-
-    # the weights fade to zero smoothly towards the invalid pixels (e.g. the edge of the map): a sharp edge at the
-    # same place in both images would give a false peak at no shift
-    fade = max(4.0, 0.04 * min(h, w))
-    dist = cv2.distanceTransform(np.pad(valid.astype(np.uint8), 1), cv2.DIST_L2, 5)[1:-1, 1:-1]
-    taper = np.clip(dist / fade, 0.0, 1.0)
-    weight = np.outer(np.hanning(h), np.hanning(w)) * (taper * taper * (3.0 - 2.0 * taper))
-
-    a = a.astype(np.float64)
-    b = b.astype(np.float64)
-    A = np.fft.rfft2((a - a[valid].mean()) * weight)
-    B = np.fft.rfft2((b - b[valid].mean()) * weight)
-    R = np.conj(A) * B
-    R /= np.maximum(np.abs(R), 1e-12)
-    corr = np.fft.irfft2(R, s=(h, w))
-
-    py, px = np.unravel_index(int(np.argmax(corr)), corr.shape)
-    rows = (py + np.arange(-2, 3)) % h
-    cols = (px + np.arange(-2, 3)) % w
-    patch = corr[np.ix_(rows, cols)]
-    response = float(patch.sum())
-
-    # sub-pixel peak: centroid of the positive values of the 3 x 3 neighbourhood
-    weights = np.clip(patch[1:4, 1:4], 0.0, None)
-    total = weights.sum()
-    oy, ox = 0.0, 0.0
-    if total > 0.0:
-        oy = float((weights.sum(axis=1) * np.arange(-1, 2)).sum() / total)
-        ox = float((weights.sum(axis=0) * np.arange(-1, 2)).sum() / total)
-
-    dy = py + oy
-    dx = px + ox
-    if dy > h / 2:
-        dy -= h
-    if dx > w / 2:
-        dx -= w
-    return dx, dy, response
+# phaseShift (phase correlation restricted to the valid pixels) is in source/Alignment.py, imported above
 
 
 def estimateGlobalOffset(src_qimage, dst_qimage, M, max_side=GLOBAL_MAX_SIDE):
@@ -499,6 +451,123 @@ class ExistingRegion(object):
         self.area = int(np.count_nonzero(self.mask))
 
 
+class RitmRefit(object):
+    """
+    Re-fit outlines to the image with RITM (the network of the positive/negative clicks tool). The network is loaded
+    on first use and freed by close().
+    """
+
+    def __init__(self, taglab_dir):
+        self.taglab_dir = taglab_dir
+        self.predictor = None
+        self.device = None
+        self.network = None
+
+    def load(self):
+
+        if self.predictor is not None:
+            return
+
+        from models.isegm.inference import utils as ritmutils
+        from models.isegm.inference.predictors import get_predictor
+
+        self.device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        model_path = os.path.join(self.taglab_dir, "models", "ritm_corals.pth")
+        self.network = ritmutils.load_is_model(model_path, self.device, cpu_dist_maps=False)
+        self.network.to(self.device)
+        # no zoom-in and no flip: each colony is cropped and resized here, one prediction per colony
+        self.predictor = get_predictor(self.network, 'NoBRS', self.device, with_flip=False, zoom_in_params=None)
+
+    def close(self):
+        self.predictor = None
+        self.network = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def refit(self, img, mask, use_prev_mask=True):
+        """
+        The outline (mask) fitted to the image with RITM: the old outline is the starting mask, with one positive
+        click at its most interior point (use_prev_mask=False: the click only). It returns the new mask (same size;
+        empty if RITM finds nothing), or None if the colony is too small to try.
+        """
+        from models.isegm.inference.clicker import Clicker, Click
+
+        rows, cols = np.nonzero(mask)
+        if len(rows) == 0:
+            return None
+        y0, y1 = rows.min(), rows.max() + 1
+        x0, x1 = cols.min(), cols.max() + 1
+        cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+        ew = max(RITM_MIN_CROP, RITM_EXPANSION * (x1 - x0))
+        eh = max(RITM_MIN_CROP, RITM_EXPANSION * (y1 - y0))
+        H, W = mask.shape
+        qx0 = max(0, int(math.floor(cx - ew / 2)))
+        qy0 = max(0, int(math.floor(cy - eh / 2)))
+        qx1 = min(W, int(math.ceil(cx + ew / 2)))
+        qy1 = min(H, int(math.ceil(cy + eh / 2)))
+        qw, qh = qx1 - qx0, qy1 - qy0
+
+        crop = img[qy0:qy1, qx0:qx1]
+        mcrop = mask[qy0:qy1, qx0:qx1].astype(np.float32)
+
+        f = RITM_INPUT_SIDE / max(qw, qh)
+        size = (max(1, int(round(qw * f))), max(1, int(round(qh * f))))
+        small = cv2.resize(crop, size, interpolation=cv2.INTER_AREA if f < 1.0 else cv2.INTER_LINEAR)
+        msmall = cv2.resize(mcrop, size, interpolation=cv2.INTER_LINEAR)
+        binary = (msmall > 0.5).astype(np.uint8)
+        if binary.sum() == 0:
+            return None
+
+        dist = cv2.distanceTransform(np.pad(binary, 1), cv2.DIST_L2, 5)[1:-1, 1:-1]
+        py, px = np.unravel_index(int(np.argmax(dist)), dist.shape)
+
+        self.load()
+        clicker = Clicker()
+        clicker.add_click(Click(is_positive=True, coords=(int(py), int(px))))
+        start = binary.astype(np.float32) if use_prev_mask else np.zeros(binary.shape, dtype=np.float32)
+        prev_mask = torch.from_numpy(start).unsqueeze(0).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            self.predictor.set_input_image(np.ascontiguousarray(small))
+            pred = self.predictor.get_prediction(clicker, prev_mask=prev_mask)
+
+        prob = cv2.resize(pred.astype(np.float32), (qw, qh), interpolation=cv2.INTER_LINEAR)
+        seg = largestComponent((prob > 0.5).astype(np.uint8), reference=mask[qy0:qy1, qx0:qx1])
+
+        out = np.zeros_like(mask, dtype=np.uint8)
+        out[qy0:qy1, qx0:qx1] = seg
+        return out
+
+
+def acceptRefit(mask, refitted):
+    """
+    Whether the re-fitted outline replaces the old one (mask): it must overlap it enough and its area must not change
+    too much. Returns (accepted, IoU, area ratio).
+    """
+    if refitted is None:
+        return False, None, None
+    inter = int(np.count_nonzero(refitted & mask))
+    union = int(np.count_nonzero(refitted | mask))
+    iou = inter / union if union > 0 else 0.0
+    ratio = float(refitted.sum()) / float(max(1, mask.sum()))
+    return iou >= MIN_REFIT_IOU and REFIT_AREA_RANGE[0] <= ratio <= REFIT_AREA_RANGE[1], iou, ratio
+
+
+def refitBox(blob, width, height):
+    """
+    The box [top, left, w, h] of the map around a region with room for the RITM crop (see RitmRefit.refit), clipped
+    to the map.
+    """
+    top, left, w, h = [float(v) for v in blob.bbox]
+    cx, cy = left + w / 2.0, top + h / 2.0
+    ew = max(RITM_MIN_CROP, RITM_EXPANSION * w) / 2.0 + 4
+    eh = max(RITM_MIN_CROP, RITM_EXPANSION * h) / 2.0 + 4
+    x0 = max(0, int(math.floor(cx - ew)))
+    y0 = max(0, int(math.floor(cy - eh)))
+    x1 = min(int(width), int(math.ceil(cx + ew)))
+    y1 = min(int(height), int(math.ceil(cy + eh)))
+    return [y0, x0, x1 - x0, y1 - y0]
+
+
 class CarryOverContext(object):
 
     def __init__(self, src_image, dst_image, src_qimage, dst_qimage, placement, taglab_dir, refit=True,
@@ -518,9 +587,7 @@ class CarryOverContext(object):
 
         self.existing = [ExistingRegion(b) for b in (existing_blobs or []) if b.class_name != "Empty"]
 
-        self.predictor = None
-        self.device = None
-        self.network = None
+        self.ritm = RitmRefit(taglab_dir)
 
         self.src_dem = None
         self.dst_dem = None
@@ -533,25 +600,30 @@ class CarryOverContext(object):
             if reader is not None:
                 reader.close()
         self.src_dem = self.dst_dem = None
-        self.predictor = None
-        self.network = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.ritm.close()
+
+    # the RITM network (shared by the tests between contexts)
+    @property
+    def predictor(self):
+        return self.ritm.predictor
+
+    @predictor.setter
+    def predictor(self, value):
+        self.ritm.predictor = value
+
+    @property
+    def device(self):
+        return self.ritm.device
+
+    @device.setter
+    def device(self, value):
+        self.ritm.device = value
 
     def loadRitm(self):
+        self.ritm.load()
 
-        if self.predictor is not None:
-            return
-
-        from models.isegm.inference import utils as ritmutils
-        from models.isegm.inference.predictors import get_predictor
-
-        self.device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-        model_path = os.path.join(self.taglab_dir, "models", "ritm_corals.pth")
-        self.network = ritmutils.load_is_model(model_path, self.device, cpu_dist_maps=False)
-        self.network.to(self.device)
-        # no zoom-in and no flip: each colony is cropped and resized here, one prediction per colony
-        self.predictor = get_predictor(self.network, 'NoBRS', self.device, with_flip=False, zoom_in_params=None)
+    def refitWithRitm(self, img, mask, use_prev_mask=True):
+        return self.ritm.refit(img, mask, use_prev_mask)
 
     def cropTarget(self, box):
         return qimageToNumpyArray(cropQImage(self.dst_qimage, box))
@@ -591,59 +663,6 @@ class CarryOverContext(object):
             if inter >= EXISTING_OVERLAP * min(area, region.area) and inter > best_inter:
                 best_id, best_inter = region.id, inter
         return best_id
-
-    def refitWithRitm(self, img, mask, use_prev_mask=True):
-        """
-        The outline (mask) fitted to the image with RITM: the old outline is the starting mask, with one positive
-        click at its most interior point (use_prev_mask=False: the click only). It returns the new mask (same size;
-        empty if RITM finds nothing), or None if the colony is too small to try.
-        """
-        from models.isegm.inference.clicker import Clicker, Click
-
-        rows, cols = np.nonzero(mask)
-        if len(rows) == 0:
-            return None
-        y0, y1 = rows.min(), rows.max() + 1
-        x0, x1 = cols.min(), cols.max() + 1
-        cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
-        ew = max(RITM_MIN_CROP, RITM_EXPANSION * (x1 - x0))
-        eh = max(RITM_MIN_CROP, RITM_EXPANSION * (y1 - y0))
-        H, W = mask.shape
-        qx0 = max(0, int(math.floor(cx - ew / 2)))
-        qy0 = max(0, int(math.floor(cy - eh / 2)))
-        qx1 = min(W, int(math.ceil(cx + ew / 2)))
-        qy1 = min(H, int(math.ceil(cy + eh / 2)))
-        qw, qh = qx1 - qx0, qy1 - qy0
-
-        crop = img[qy0:qy1, qx0:qx1]
-        mcrop = mask[qy0:qy1, qx0:qx1].astype(np.float32)
-
-        f = RITM_INPUT_SIDE / max(qw, qh)
-        size = (max(1, int(round(qw * f))), max(1, int(round(qh * f))))
-        small = cv2.resize(crop, size, interpolation=cv2.INTER_AREA if f < 1.0 else cv2.INTER_LINEAR)
-        msmall = cv2.resize(mcrop, size, interpolation=cv2.INTER_LINEAR)
-        binary = (msmall > 0.5).astype(np.uint8)
-        if binary.sum() == 0:
-            return None
-
-        dist = cv2.distanceTransform(np.pad(binary, 1), cv2.DIST_L2, 5)[1:-1, 1:-1]
-        py, px = np.unravel_index(int(np.argmax(dist)), dist.shape)
-
-        self.loadRitm()
-        clicker = Clicker()
-        clicker.add_click(Click(is_positive=True, coords=(int(py), int(px))))
-        start = binary.astype(np.float32) if use_prev_mask else np.zeros(binary.shape, dtype=np.float32)
-        prev_mask = torch.from_numpy(start).unsqueeze(0).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            self.predictor.set_input_image(np.ascontiguousarray(small))
-            pred = self.predictor.get_prediction(clicker, prev_mask=prev_mask)
-
-        prob = cv2.resize(pred.astype(np.float32), (qw, qh), interpolation=cv2.INTER_LINEAR)
-        seg = largestComponent((prob > 0.5).astype(np.uint8), reference=mask[qy0:qy1, qx0:qx1])
-
-        out = np.zeros_like(mask, dtype=np.uint8)
-        out[qy0:qy1, qx0:qx1] = seg
-        return out
 
     def demSignals(self, blob, mask, box):
         """
@@ -761,13 +780,10 @@ def processColony(ctx, blob):
     if ctx.refit:
         refitted = ctx.refitWithRitm(tgt, mask)
         if refitted is not None:
-            inter = int(np.count_nonzero(refitted & mask))
-            union = int(np.count_nonzero(refitted | mask))
-            iou = inter / union if union > 0 else 0.0
-            ratio = float(refitted.sum()) / float(mask.sum())
+            accepted, iou, ratio = acceptRefit(mask, refitted)
             result.signals["refit_iou"] = iou
             result.signals["area_ratio"] = ratio
-            if iou >= MIN_REFIT_IOU and REFIT_AREA_RANGE[0] <= ratio <= REFIT_AREA_RANGE[1]:
+            if accepted:
                 new_mask = refitted
                 refit_ok = True
     result.refit = refit_ok

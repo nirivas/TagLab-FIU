@@ -21,7 +21,7 @@ from source import Alignment as AL
 class QtRotateMapWidget(QDialog):
     """
     Create a rotated copy of a map: 90, 180, 270 degrees (exact, no resampling) or any angle.
-    The new map is stored in self.newImage when the dialog is accepted.
+    The new map is stored in self.newImage when the dialog is accepted (TagLab puts it in place of self.oldImage).
     """
 
     THUMB_SIZE = 400
@@ -35,6 +35,8 @@ class QtRotateMapWidget(QDialog):
         self.taglab_dir = taglab_dir
         self.project = project
         self.newImage = None
+        self.oldImage = None
+        self.matrix = None
         self.thumbnails = {}
 
         self.comboMap = QComboBox()
@@ -182,9 +184,14 @@ class QtRotateMapWidget(QDialog):
 
         if image.width is not None and image.height is not None:
             M, out_w, out_h, exact = AL.rotationMatrix(image.width, image.height, angle)
-            txt = "New map: '{}'\nSize: {} x {} pixels\n".format(image.name + self.suffix(), out_w, out_h)
+            txt = "Size after rotation: {} x {} pixels\n".format(out_w, out_h)
             txt += "Exact rotation (no resampling)." if exact else "The map is resampled (bilinear interpolation)."
-            txt += "\n\nAll the channels (RGB, DEM) and the regions/points are rotated. The original map is not changed."
+            txt += "\n\nAll the channels (RGB, DEM) and the regions/points are rotated. The rotated map replaces " \
+                   "'{}' in the project (same name); its image files are new files with the suffix '{}', " \
+                   "the original files are not changed.".format(image.name, self.suffix())
+            lost = AL.notCarriedOver(image)
+            if len(lost) > 0:
+                txt += "\n\nNot carried over to the rotated map: " + ", ".join(lost) + "."
             self.infoLabel.setText(txt)
 
         try:
@@ -205,7 +212,8 @@ class QtRotateMapWidget(QDialog):
     @pyqtSlot()
     def rotate(self) -> None:
         """
-        Create the rotated copy of the selected map (stored in self.newImage) and close the dialog.
+        Create the rotated copy of the selected map (stored in self.newImage, with the map it replaces in
+        self.oldImage and the pixel transformation in self.matrix) and close the dialog.
         """
         image = self.selectedImage()
         if image.width is None or image.height is None or len(image.channels) == 0:
@@ -245,4 +253,6 @@ class QtRotateMapWidget(QDialog):
             return
         QApplication.restoreOverrideCursor()
         progress.close()
+        self.oldImage = image
+        self.matrix = M
         self.accept()

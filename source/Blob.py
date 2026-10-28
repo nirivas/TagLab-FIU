@@ -112,7 +112,7 @@ class Blob(object):
     def copy(self):
         blob = Blob(None, 0, 0, 0)
 
-        blob.instance_name = blob.instance_name
+        blob.instance_name = self.instance_name
         blob.blob_name = self.blob_name
         blob.id = self.id
         blob.version = self.version + 1
@@ -162,6 +162,21 @@ class Blob(object):
         #restore deepcopy (also to the newly created Blob!
         blob.__deepcopy__ = self.__deepcopy__ = deepcopy_method
         return blob
+
+    def translate(self, dx, dy):
+        """
+        Move the region by (dx, dy) pixels (whole pixels keep its mask, area and perimeter unchanged).
+        """
+        shift = np.array([dx, dy])
+        self.contour = self.contour + shift
+        self.inner_contours = [inner + shift for inner in self.inner_contours]
+        bbox = np.array(self.bbox)
+        bbox[0] += dy
+        bbox[1] += dx
+        self.bbox = bbox
+        self.centroid = np.array(self.centroid, dtype=float) + shift
+        self.qpath = None
+        self.setId(self.id)
 
     def setId(self, id):
         # a string with a number to identify the blob plus its centroid

@@ -18,6 +18,8 @@ class QtCarryOverReview(QWidget):
     showColony = pyqtSignal(int, int)     # source region id, target region id
     keepColony = pyqtSignal(int)          # target region id
     removeColony = pyqtSignal(int)        # target region id
+    moveColony = pyqtSignal(int)          # target region id
+    refitColony = pyqtSignal(int)         # target region id
     closed = pyqtSignal()
 
     COLUMNS = ["Status", "Score", "Why", "Old id", "New id"]
@@ -31,7 +33,7 @@ class QtCarryOverReview(QWidget):
         self.setStyleSheet("background-color: rgb(40,40,40); color: white")
         self.setWindowTitle("Review carried-over colonies: " + source_image.name + " -> " + target_image.name)
         self.setMinimumSize(560, 420)
-        self.resize(720, 480)
+        self.resize(900, 480)
 
         self.source_image = source_image
         self.target_image = target_image
@@ -56,7 +58,8 @@ class QtCarryOverReview(QWidget):
 
         helpLabel = QLabel("Each colony is shown in both maps with its old and new outline selected. Edit it with "
                            "the usual tools if needed (or change its class, e.g. to a dead-coral class), then keep "
-                           "or remove it. Keys: N next, P previous, K keep, Delete remove.")
+                           "or remove it. If it landed in the wrong place, Move it (SHIFT + drag or the arrow keys) "
+                           "and Re-fit its outline. Keys: N next, P previous, K keep, Delete remove.")
         helpLabel.setWordWrap(True)
 
         self.btnPrevious = QPushButton("< Previous (P)")
@@ -70,6 +73,15 @@ class QtCarryOverReview(QWidget):
         self.btnRemove.setToolTip("The colony is gone: the region is deleted from the new map and it becomes "
                                   "\"dead\" in the comparison table.")
         self.btnRemove.clicked.connect(self.removeCurrent)
+        self.btnMove = QPushButton("Move (drag / arrows)")
+        self.btnMove.setToolTip("Select the colony and activate the Move Region tool: SHIFT + drag it, or move it with "
+                                "the arrow keys (SHIFT + arrow: 10 pixels). Its status does not change: press K "
+                                "to keep it.")
+        self.btnMove.clicked.connect(self.moveCurrent)
+        self.btnRefit = QPushButton("Re-fit outline")
+        self.btnRefit.setToolTip("Fit the outline to the new map with RITM (e.g. after moving it). Its status does "
+                                 "not change: press K to keep it.")
+        self.btnRefit.clicked.connect(self.refitCurrent)
         self.btnClose = QPushButton("Close")
         self.btnClose.clicked.connect(self.close)
 
@@ -79,6 +91,9 @@ class QtCarryOverReview(QWidget):
         layoutButtons.addSpacing(20)
         layoutButtons.addWidget(self.btnKeep)
         layoutButtons.addWidget(self.btnRemove)
+        layoutButtons.addSpacing(20)
+        layoutButtons.addWidget(self.btnMove)
+        layoutButtons.addWidget(self.btnRefit)
         layoutButtons.addStretch()
         layoutButtons.addWidget(self.btnClose)
 
@@ -212,6 +227,18 @@ class QtCarryOverReview(QWidget):
                 self.removed.add(blob.id)
             self.refresh()
             self.next()
+
+    @pyqtSlot()
+    def moveCurrent(self):
+        blob = self.currentBlob()
+        if blob is not None:
+            self.moveColony.emit(blob.id)
+
+    @pyqtSlot()
+    def refitCurrent(self):
+        blob = self.currentBlob()
+        if blob is not None:
+            self.refitColony.emit(blob.id)
 
     @staticmethod
     def plainKey(event):
