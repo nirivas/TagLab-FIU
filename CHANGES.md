@@ -83,8 +83,11 @@ under the same GPL-3 licence. It changes the following.
   markers.
 - **Map edges:** maps are no longer cut at the edges, and the result keeps every pixel of both maps.
 - **Speed:** it is much faster and uses far less memory (about 2 GB instead of about 30 GB on large maps).
-- **Auto Markers:** finds corresponding points between the two maps automatically. It reads only the parts of the
-  maps it needs, so it uses much less memory on large maps.
+- **Auto Markers:** finds corresponding points between the two maps automatically, whatever the rotation between
+  them. It reads only the parts of the maps it needs, so it uses much less memory on large maps.
+- **Rotation:** the Alignment Tool rotates the map by whatever angle the markers give, so there is no need to rotate
+  a map first. (The Rotate Map tool of earlier lab versions has been removed: rotating and then aligning gave the
+  same result with an extra pair of files.)
 - **Scale:** it can estimate and (optionally) apply the scale difference between two surveys.
 - **Markers:** they are saved with the project.
 - **DEMs:** they keep their no-data areas, and georeferencing is preserved.
@@ -107,9 +110,15 @@ under the same GPL-3 licence. It changes the following.
     - **Cancel.**
   - Nothing is saved automatically.
 - **Checking the alignment in the preview:**
-  - **Views** (a list in each pane): Blend, Checkerboard, **Swipe** (the reference left of a line that follows the
-    mouse, the aligned map right of it), **Flicker** (the two maps in turn, 1–8 times a second: a shift shows as a
-    jump) and Difference.
+  - **Views** (a list in each pane):
+    - Blend.
+    - **Red / cyan overlay:** the reference in red and the aligned map in cyan, on top of each other. Where they
+      match, the image is grey; a shift shows as red and cyan edges side by side. Both maps are brought to the same
+      brightness first, so a darker year doesn't tint the image. The slider sets the contrast.
+    - Checkerboard.
+    - **Swipe:** the reference left of a line that follows the mouse, the aligned map right of it.
+    - **Flicker:** the two maps in turn, 1–8 times a second; a shift shows as a jump.
+    - Difference.
   - **Zoom:** Fit and 1:1 buttons, `+` / `−` keys, and a label with the zoom and the mm per screen pixel.
 - **Check alignment** (button in the preview): measures what is left of the misalignment on a grid of about 12 × 12
   cells over the overlap.
@@ -281,14 +290,6 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
   as the start). A new outline is used only if it is close to the old one (the same rule as Carry Regions Over);
   otherwise the moved outline is kept, and a message says how many outlines were re-fitted.
 - **Undo:** one step per drag, per series of arrow presses on the same regions, and per re-fit.
-
-## Rotate Map (Project > Rotate Map…)
-- Rotates a map: 90°, 180° and 270° are exact, or you can enter any angle.
-- The DEM, the colonies, the points and the georeferencing are rotated too.
-- **The rotated map replaces the original in the project.** It keeps the original's name and id, so colony names,
-  comparison tables and exports stay the same; only its files are new (suffix `_rot90`, `_rot180`, …). The original
-  files stay on disk, and the project stops using them once you save it. The comparison tables, the "to check" marks
-  and the alignment markers move to the rotated map. Remember to save the project.
 
 ## Dictionaries
 - **`spongenursery.json`** (in the main folder, next to `FDEP.json`): the sponge nursery labels.

@@ -75,9 +75,10 @@ class ImagePyramid(object):
 class AlignmentPreviewPane(QWidget):
     """
     Preview of the alignment: the reference image and the image to align (transformed with the current
-    transformation) are rendered on the CPU, only for the visible area, and combined: blend, checkerboard, swipe
-    (the reference left of a divider that follows the mouse), flicker (the two maps in turn) or difference. The
-    height difference mode shows the heights of the aligned DEM minus the reference DEM (blue lower, red higher).
+    transformation) are rendered on the CPU, only for the visible area, and combined: blend, red / cyan overlay
+    (grey where the two maps match, coloured edges where they don't), checkerboard, swipe (the reference left of a
+    divider that follows the mouse), flicker (the two maps in turn) or difference. The height difference mode shows
+    the heights of the aligned DEM minus the reference DEM (blue lower, red higher).
     Left-drag pans, the wheel zooms.
     """
 
@@ -89,8 +90,10 @@ class AlignmentPreviewPane(QWidget):
     SWIPE = 3
     FLICKER = 4
     HEIGHT = 5
+    OVERLAY = 6
 
     BACKGROUND = (40, 40, 40)
+    OVERLAY_STD = 48.0      # red / cyan overlay: standard deviation of the stretched grey levels at 100% contrast
     MAX_ZOOM = 32.0
 
     def __init__(self, mode, parent=None):
@@ -104,6 +107,7 @@ class AlignmentPreviewPane(QWidget):
         self.flickerRate = 2            # changes per second
         self.flickerMoving = False      # flicker: the image to align is shown now
         self.swipeX = None              # swipe: screen x of the divider (None: the middle)
+        self.overlayContrast = 1.0      # red / cyan overlay: contrast of the two maps
         self.ref: Optional[ImagePyramid] = None
         self.mov: Optional[ImagePyramid] = None
         self.M = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
@@ -158,10 +162,13 @@ class AlignmentPreviewPane(QWidget):
 
     def setParameter(self, mode, value) -> None:
         """
-        The slider value of a mode: alpha (%), tile size (px), flicker rate (changes per second), threshold.
+        The slider value of a mode: alpha (%), contrast (%), tile size (px), flicker rate (changes per second),
+        threshold, height range (cm).
         """
         if mode == AlignmentPreviewPane.BLEND:
             self.alpha = min(max(value / 100.0, 0.0), 1.0)
+        elif mode == AlignmentPreviewPane.OVERLAY:
+            self.overlayContrast = max(10, int(value)) / 100.0
         elif mode == AlignmentPreviewPane.CHECKERBOARD:
             self.checkerSize = int(value)
         elif mode == AlignmentPreviewPane.FLICKER:
@@ -354,6 +361,14 @@ class AlignmentPreviewPane(QWidget):
             out[both] = mix[both]
             out[onlyR] = ref[onlyR]
             out[onlyM] = mov[onlyM]
+        elif self.mode == AlignmentPreviewPane.OVERLAY:
+            # reference -> red, aligned map -> green + blue (cyan): equal grey levels give grey
+            gr = self.stretch(cv2.cvtColor(ref, cv2.COLOR_BGRA2GRAY), both if both.any() else rv)
+            gm = self.stretch(cv2.cvtColor(mov, cv2.COLOR_BGRA2GRAY), both if both.any() else mv)
+            out[rv | mv, :3] = 0
+            out[rv, 2] = gr[rv]
+            out[mv, 1] = gm[mv]
+            out[mv, 0] = gm[mv]
         elif self.mode == AlignmentPreviewPane.DIFFERENCE:
             gr = cv2.cvtColor(ref, cv2.COLOR_BGRA2GRAY)
             gm = cv2.cvtColor(mov, cv2.COLOR_BGRA2GRAY)
@@ -390,6 +405,17 @@ class AlignmentPreviewPane(QWidget):
 
         out[:, :, 3] = 255
         return out
+
+    def stretch(self, gray, mask):
+        """
+        Grey levels stretched to mean 128 and the same spread for both maps (measured on mask), so that a
+        difference of brightness or contrast between the two maps does not tint the red / cyan overlay.
+        """
+        sel = gray[mask] if mask.any() else gray
+        mean = float(sel.mean())
+        std = max(float(sel.std()), 1.0)
+        gain = self.OVERLAY_STD * self.overlayContrast / std
+        return np.clip(128.0 + (gray.astype(np.float32) - mean) * gain, 0, 255).astype(np.uint8)
 
     def swipePosition(self) -> int:
         x = self.width() // 2 if self.swipeX is None else self.swipeX
@@ -473,6 +499,8 @@ class AlignmentPreviewPane(QWidget):
             self.drawCaption(p, "Reference | Aligned")
         elif self.mode == AlignmentPreviewPane.FLICKER:
             self.drawCaption(p, "Aligned" if self.flickerMoving else "Reference")
+        elif self.mode == AlignmentPreviewPane.OVERLAY:
+            self.drawCaption(p, "Red = reference, cyan = aligned")
         elif self.mode == AlignmentPreviewPane.HEIGHT:
             if self.heightDiff is None:
                 self.drawCaption(p, "Height difference: both maps need a DEM")
@@ -544,11 +572,12 @@ class AlignmentPreviewPane(QWidget):
 
 class PreviewModeControls(QWidget):
     """
-    The mode list of a preview pane and the slider of its current mode (alpha, tile size, flicker rate, threshold);
-    each mode keeps its own slider value.
+    The mode list of a preview pane and the slider of its current mode (alpha, contrast, tile size, flicker rate,
+    threshold, height range); each mode keeps its own slider value.
     """
 
     NAMES = {AlignmentPreviewPane.BLEND: "Blend",
+             AlignmentPreviewPane.OVERLAY: "Red / cyan overlay",
              AlignmentPreviewPane.CHECKERBOARD: "Checkerboard",
              AlignmentPreviewPane.SWIPE: "Swipe",
              AlignmentPreviewPane.FLICKER: "Flicker",
@@ -556,6 +585,9 @@ class PreviewModeControls(QWidget):
              AlignmentPreviewPane.HEIGHT: "Height difference"}
 
     TOOLTIPS = {AlignmentPreviewPane.BLEND: "The two maps on top of each other (alpha: weight of the aligned map)",
+                AlignmentPreviewPane.OVERLAY: "The reference in red, the aligned map in cyan, on top of each other: "
+                                              "grey where they match; a shift shows as red and cyan edges side by "
+                                              "side. The slider sets the contrast",
                 AlignmentPreviewPane.CHECKERBOARD: "Tiles of the two maps in turn: features must continue across "
                                                    "the tile borders",
                 AlignmentPreviewPane.SWIPE: "The reference left of the divider, the aligned map right of it: move "
@@ -568,6 +600,7 @@ class PreviewModeControls(QWidget):
 
     # mode: (minimum, maximum, default, label)
     SLIDERS = {AlignmentPreviewPane.BLEND: (0, 100, 50, "Alpha: {:d}"),
+               AlignmentPreviewPane.OVERLAY: (50, 300, 100, "Contrast: {:d}%"),
                AlignmentPreviewPane.CHECKERBOARD: (8, 512, 64, "Tile: {:d} px"),
                AlignmentPreviewPane.FLICKER: (1, 8, 2, "Rate: {:d}/s"),
                AlignmentPreviewPane.DIFFERENCE: (0, 255, 32, "Threshold: {:d}"),
@@ -723,8 +756,8 @@ class QtAlignmentToolWidget(QWidget):
     ROT_STEP = 0.01      # degrees per slider tick
     TRA_STEP = 0.1       # millimeters per slider tick
 
-    PREVIEW_MODES = [AlignmentPreviewPane.BLEND, AlignmentPreviewPane.CHECKERBOARD, AlignmentPreviewPane.SWIPE,
-                     AlignmentPreviewPane.FLICKER, AlignmentPreviewPane.DIFFERENCE]
+    PREVIEW_MODES = [AlignmentPreviewPane.BLEND, AlignmentPreviewPane.OVERLAY, AlignmentPreviewPane.CHECKERBOARD,
+                     AlignmentPreviewPane.SWIPE, AlignmentPreviewPane.FLICKER, AlignmentPreviewPane.DIFFERENCE]
     # the DEM shading of the map to align is lit from the same direction as the reference (in the reference frame):
     # it is computed again if the rotation changes by more than this (degrees)
     SHADE_TOLERANCE = 5.0

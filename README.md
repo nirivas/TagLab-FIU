@@ -3,7 +3,8 @@
 > **FIU Coral Reef Fisheries lab version.** This is a modified version of TagLab 2026.4.1
 > (https://github.com/cnr-isti-vclab/TagLab), distributed under the same GPL-3 license. The changes are listed in
 > [CHANGES.md](CHANGES.md): data-safety and crash fixes, per-colony DEM metrics, faster classification and training
-> fixes, a rewritten Alignment Tool with automatic markers, and a Rotate Map tool.
+> fixes, a rewritten Alignment Tool with automatic markers and alignment checking, carrying colonies over to a new
+> year, year-to-year matching fixes, and a Move Region tool.
 > **This is the only TagLab you need**: it is the official TagLab 2026.4.1 plus the lab's changes. Do not install the
 > official TagLab as well.
 > **To install it on a computer, follow [SETUP_NEW_COMPUTER.md](SETUP_NEW_COMPUTER.md)** (not the instructions below).

@@ -342,58 +342,6 @@ def georeferenceOfCanvas(reference_filename, left, top):
         return ref.crs, ref.transform * Affine.translation(-left, -top)
 
 
-def transformedGeoreference(georef_filename, M):
-    """
-    CRS and transform of an image obtained transforming the georeferenced image georef_filename with M
-    (pixels -> pixels, pixel-center convention), so that each pixel keeps its geographic position.
-    Returns (None, None) if the image is not georeferenced.
-    """
-
-    if georef_filename is None or georef_filename == "":
-        return None, None
-
-    with rio.open(georef_filename) as src:
-        if src.crs is None:
-            return None, None
-        crs = src.crs
-        transform = src.transform
-
-    # rasterio transforms use the pixel-corner convention
-    C = composeMatrix(composeMatrix(np.array([[1.0, 0.0, 0.5], [0.0, 1.0, 0.5]]), M),
-                      np.array([[1.0, 0.0, -0.5], [0.0, 1.0, -0.5]]))
-    A = Affine(C[0, 0], C[0, 1], C[0, 2], C[1, 0], C[1, 1], C[1, 2])
-    return crs, transform * ~A
-
-
-def rotationMatrix(width, height, angle_deg):
-    """
-    Matrix (pixels -> pixels) and size of the output to rotate an image of width x height pixels by angle_deg
-    (positive = clockwise on screen). Multiples of 90 degrees are exact index mappings (no resampling); other
-    angles rotate around the center of the image and the canvas is enlarged to contain the whole image.
-    Returns (M, out_w, out_h, exact).
-    """
-
-    a = angle_deg % 360.0
-    W, H = width, height
-    for (k, M, ow, oh) in [(0, [[1, 0, 0], [0, 1, 0]], W, H),
-                           (90, [[0, -1, H - 1], [1, 0, 0]], H, W),
-                           (180, [[-1, 0, W - 1], [0, -1, H - 1]], W, H),
-                           (270, [[0, 1, 0], [-1, 0, W - 1]], H, W),
-                           (360, [[1, 0, 0], [0, 1, 0]], W, H)]:
-        if abs(a - k) < 1e-9:
-            return np.array(M, dtype=np.float64), ow, oh, True
-
-    R = paramsToMatrix(angle_deg, 1.0, 0.0, 0.0)
-    # extent of the image (pixel centers from 0 to W-1, so the image covers -0.5 .. W-0.5)
-    corners = applyMatrix(R, [[-0.5, -0.5], [W - 0.5, -0.5], [W - 0.5, H - 0.5], [-0.5, H - 0.5]])
-    cmin = corners.min(axis=0)
-    cmax = corners.max(axis=0)
-    out_w = int(math.ceil(cmax[0] - cmin[0] - 1e-6))
-    out_h = int(math.ceil(cmax[1] - cmin[1] - 1e-6))
-    R[:, 2] = -0.5 - cmin
-    return R, out_w, out_h, False
-
-
 def uniqueSuffix(project, image, base, taglab_dir):
     """
     A suffix (base, base2, base3, ..) such that neither the new image id nor the new files already exist.

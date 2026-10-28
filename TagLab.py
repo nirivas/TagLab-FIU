@@ -49,7 +49,6 @@ from source.QtExportSVG import QtSVGExport  # Import the svg export dialog
 import pprint
 # PYTORCH
 from source.QtAlignmentToolWidget import QtAlignmentToolWidget
-from source.QtRotateMapWidget import QtRotateMapWidget
 
 try:
     import torch
@@ -64,7 +63,6 @@ import csv
 import source.Mask as Mask
 import source.RasterOps as rasterops
 from source import DemMetrics
-from source import Alignment as AL
 from source import PointsFromRegions
 from source import CarryOver
 from source.QtCarryOverWidget import QtCarryOverWidget
@@ -1148,10 +1146,6 @@ class TagLab(QMainWindow):
         alignToolAct = QAction("Alignment Tool", self)
         alignToolAct.triggered.connect(self.openAlignmentTool)
 
-        rotateMapAct = QAction("Rotate Map...", self)
-        rotateMapAct.setStatusTip("Create a rotated copy of a map (90/180/270 degrees or any angle)")
-        rotateMapAct.triggered.connect(self.openRotateMapDialog)
-
         regionAttributesAct = QAction("Region Attributes...", self)
         regionAttributesAct.triggered.connect(self.editRegionAttributes)
 
@@ -1314,7 +1308,6 @@ class TagLab(QMainWindow):
         self.projectmenu.addAction(setWorkingAreaAct)
         self.projectmenu.addSeparator()
         self.projectmenu.addAction(alignToolAct)
-        self.projectmenu.addAction(rotateMapAct)
         self.projectmenu.addSeparator()
         self.projectmenu.addAction(createDicAct)
         self.projectmenu.addSeparator()
@@ -4572,7 +4565,7 @@ class TagLab(QMainWindow):
 
     def replaceImages(self, replacements, working_area_shift=None):
         """
-        Put the transformed copies made by Rotate Map and by the Alignment Tool in place of the original maps:
+        Put the transformed copies made by the Alignment Tool in place of the original maps:
         replacements is a list of (original map, copy, M), M mapping the pixels of the original to those of the copy.
         The copies take the name and the id of the originals; the original files stay on disk. The working area is
         shifted by working_area_shift (dx, dy) if given (the reference map was extended to the left/top).
@@ -4622,42 +4615,6 @@ class TagLab(QMainWindow):
 
         self.updateToolStatus()
         self.updatePanels()
-
-    @pyqtSlot()
-    def openRotateMapDialog(self):
-        if len(self.project.images) == 0:
-            msgBox = QMessageBox()
-            msgBox.setWindowTitle(self.TAGLAB_VERSION)
-            msgBox.setText("There are no maps to rotate.")
-            msgBox.exec()
-            return
-
-        current = 0
-        if self.activeviewer is not None and self.activeviewer.image in self.project.images:
-            current = self.project.images.index(self.activeviewer.image)
-
-        dialog = QtRotateMapWidget(self.taglab_dir, self.project, current, parent=self)
-        if dialog.exec() != QDialog.Accepted or dialog.newImage is None:
-            return
-
-        old = dialog.oldImage
-        lost = AL.notCarriedOver(old)
-        self.replaceImages([(old, dialog.newImage, dialog.matrix)])
-
-        logfile.info("[PROJECT] The map '" + old.id + "' has been rotated.")
-
-        txt = "The map '" + old.name + "' now uses the rotated image files:\n" + \
-              "\n".join(os.path.basename(ch.filename) for ch in dialog.newImage.channels) + \
-              "\n\nThe original files are unchanged (they are no longer part of the project once you save it)." \
-              "\n\nRemember to save the project (File > Save)."
-        if len(lost) > 0:
-            txt += "\n\nNot carried over to the rotated map: " + ", ".join(lost) + "."
-        if self.project.working_area is not None:
-            txt += "\n\nNote: the working area refers to the original orientation of the maps."
-        msgBox = QMessageBox()
-        msgBox.setWindowTitle(self.TAGLAB_VERSION)
-        msgBox.setText(txt)
-        msgBox.exec()
 
     @pyqtSlot()
     def openAlignmentTool(self):

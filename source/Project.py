@@ -521,7 +521,7 @@ class Project(QObject):
 
     def replaceImage(self, old, new, M):
         """
-        Put the transformed copy new (Rotate Map, Alignment Tool) in place of the map old: same position in the list,
+        Put the transformed copy new (Alignment Tool) in place of the map old: same position in the list,
         same id and name (only its files differ), so the comparison tables, the colony names and the exports go on
         referring to it. M maps the pixels of old to the pixels of new; the regions of new are the regions of old
         transformed by M, with the same ids.
