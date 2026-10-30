@@ -1029,6 +1029,12 @@ class TagLab(QMainWindow):
         if len(self.project.images) == 0:
             return
 
+        # SHIFT + right click is a negative point of the Move Region tool (the menu comes after the press)
+        viewer = self.sender()
+        if isinstance(viewer, QtImageViewerPlus) and viewer.point_right_press:
+            viewer.point_right_press = False
+            return
+
         menu = QMenu(self)
         menu.setAutoFillBackground(True)
 
@@ -2200,7 +2206,14 @@ class TagLab(QMainWindow):
             if self.activeviewer.tools.tool == "MATCH":
                 self.createMatch()
             elif self.activeviewer.tools.tool == "MOVEREGION":
-                self.refitSelectedRegions()
+                tool = self.activeviewer.tools.tools["MOVEREGION"]
+                if tool.hasPoints():
+                    # the outline corrected with the positive/negative points
+                    tool.confirmPoints()
+                    if self.carryover_review is not None:
+                        self.carryover_review.refresh()
+                else:
+                    self.refitSelectedRegions()
             else:
                 self.activeviewer.tools.applyTool()
 
@@ -3107,8 +3120,9 @@ class TagLab(QMainWindow):
     @pyqtSlot()
     def moveRegion(self):
         """
-        Activate the "Move Region" tool: SHIFT + drag or the arrow keys move the selected regions, SPACE re-fits
-        their outlines to the image.
+        Activate the "Move Region" tool: SHIFT + drag or the arrow keys move the selected regions, , and . turn them,
+        SHIFT + click / SHIFT + right click add positive / negative points correcting the outline of the selected
+        region; SPACE confirms the points or, without points, re-fits the outlines to the image.
         """
         self.setTool("MOVEREGION")
 
@@ -6772,6 +6786,7 @@ class TagLab(QMainWindow):
         if not self.carryOverReviewPair():
             return
 
+        self.cancelRegionPoints()
         blob = self.viewerplus2.annotations.blobById(target_id)
         if blob is None:
             return
@@ -6823,6 +6838,7 @@ class TagLab(QMainWindow):
         if not self.carryOverReviewPair():
             return
 
+        self.cancelRegionPoints()
         viewer = self.viewerplus2
         blob = viewer.annotations.blobById(target_id)
         if blob is None:
@@ -6844,11 +6860,13 @@ class TagLab(QMainWindow):
     @pyqtSlot(int)
     def moveCarriedColony(self, target_id):
         """
-        Select the colony in the new map and activate the Move Region tool (SHIFT + drag or the arrow keys).
+        Select the colony in the new map and activate the Move Region tool (SHIFT + drag or the arrow keys, , and .
+        to turn it, SHIFT + click / SHIFT + right click to correct its outline with positive / negative points).
         """
         if not self.carryOverReviewPair():
             return
 
+        self.cancelRegionPoints()
         viewer = self.viewerplus2
         blob = viewer.annotations.blobById(target_id)
         if blob is None:
@@ -6869,6 +6887,7 @@ class TagLab(QMainWindow):
         if not self.carryOverReviewPair():
             return
 
+        self.cancelRegionPoints()
         viewer = self.viewerplus2
         blob = viewer.annotations.blobById(target_id)
         if blob is None:
@@ -6879,6 +6898,16 @@ class TagLab(QMainWindow):
         self.refitSelectedRegions(viewer, [blob])
         if self.carryover_review is not None:
             self.carryover_review.refresh()
+
+    def cancelRegionPoints(self):
+        """
+        Cancel the positive/negative points of the Move Region tool not confirmed yet (the region gets back its
+        outline), e.g. when the review goes to another colony.
+        """
+        for viewer in (self.viewerplus, self.viewerplus2):
+            tool = viewer.tools.tools.get("MOVEREGION")
+            if tool is not None and tool.hasPoints():
+                tool.reset()
 
     def freeRitmRefit(self):
         if self.ritm_refit is not None:
@@ -6957,14 +6986,7 @@ class TagLab(QMainWindow):
             new_blob = CarryOver.blobFromMask(new_mask, left, top)
             if new_blob is None:
                 continue
-            new_blob.setId(blob.id)
-            new_blob.version = blob.version + 1
-            new_blob.class_name = blob.class_name
-            new_blob.instance_name = blob.instance_name
-            new_blob.note = blob.note
-            new_blob.genet = blob.genet
-            new_blob.data = {k: v for k, v in blob.data.items() if k not in DemMetrics.DEM_METRIC_NAMES}
-            new_blob.correspondence_to_check = blob.correspondence_to_check
+            new_blob.inheritInfo(blob)
             viewer.updateBlob(blob, new_blob, selected=True, redraw=False)
             refitted_ids.append(blob.id)
 

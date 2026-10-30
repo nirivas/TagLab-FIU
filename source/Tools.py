@@ -67,6 +67,7 @@ class Tools(QObject):
 
     def createTools(self):
         # TOOLS - create all the tools
+        ritm = Ritm(self.viewerplus, self.corrective_points)
         self.tools = {
             "CREATECRACK": CreateCrack(self.viewerplus),
             "SPLITBLOB": SplitBlob(self.viewerplus, self.pick_points),
@@ -82,9 +83,10 @@ class Tools(QObject):
             "MATCH": Match(self.viewerplus),
             "SELECTPOINTS": SelectPoints(self.viewerplus, self.pick_points),
             "SELECTAREA": SelectArea(self.viewerplus, self.pick_points),
-            "RITM": Ritm(self.viewerplus, self.corrective_points),
+            "RITM": ritm,
             "ROWS": Rows(self.viewerplus),
-            "MOVEREGION": MoveRegion(self.viewerplus),
+            # the positive/negative points of the Move Region tool are corrections made by the RITM tool
+            "MOVEREGION": MoveRegion(self.viewerplus, ritm),
         }
         if self.SAM_is_available:   #just if SAM is available
             self.tools["SAM"] = Sam(self.viewerplus, self.pick_points)

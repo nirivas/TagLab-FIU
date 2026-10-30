@@ -181,8 +181,9 @@ Alignment Tool.
   - **N / P:** next or previous colony.
   - **K:** keep it.
   - **Delete:** remove it; it becomes "dead" in the comparison table.
-  - **Move (drag / arrows):** selects the colony and switches to the Move Region tool, to drag it onto the right spot
-    (`,` and `.` turn it).
+  - **Move / correct:** selects the colony and switches to the Move Region tool, to drag it onto the right spot
+    (`,` and `.` turn it) and correct its outline with positive and negative points (see the Move Region tool).
+    Going to another colony cancels points that were not confirmed.
   - **Re-fit outline:** fits the outline of the colony to the image again (as above), e.g. after moving it.
   - Moving or re-fitting doesn't change the colony's status: press K to keep it.
   - You can also redraw it or change its class. Compare > Review Carried-over Colonies reopens the list.
@@ -311,10 +312,36 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
 - They keep their id, so their matches in the comparison tables and their genets stay. Class, name, note, custom
   attributes and the "to check" mark stay too. Surface area and DEM metrics are cleared, because they were measured
   at the old place.
-- **Space** re-fits the outlines of the selected regions to the image at their new place, as Carry Regions Over
-  does (RITM and colour; the outline can shrink or grow). A new outline is used only if it is close to the old one;
-  otherwise the moved outline is kept, and a message says how many outlines were re-fitted.
-- **Undo:** one step per drag, per series of arrow presses and turns on the same regions, and per re-fit.
+- **Positive and negative points** correct the outline of the selected region with RITM, as in the
+  positive/negative clicks tool, without changing tools:
+  - **Shift + click** (without dragging): positive point, on a part that belongs to the colony.
+  - **Shift + right click:** negative point, on a part that doesn't.
+  - The outline is redrawn after each point. **Ctrl + Z** removes the last point, **Space** confirms, **Esc**
+    cancels (the outline goes back to what it was).
+  - Move and turn first: dragging, the arrows and the turn keys do nothing while there are points.
+  - As in the RITM tool, the area RITM works on is the view at the first point, and points outside it are
+    ignored: zoom so that the colony and its surroundings are visible.
+  - Tested on the 99 sponge outlines of Nursery1 (May), made too big, too small, or turned and shifted: the median
+    overlap with the hand-made outline (IoU) goes from 0.56 to 0.72 / 0.87 / 0.92 after 1 / 2 / 3 points, and 90%
+    of them are at 0.85 or better after 3 points. A point never made an outline worse. About 0.5 s per point on this
+    computer (the first one takes longer when the view is large).
+- **Space** confirms the points or, if there are none, re-fits the outlines of the selected regions to the image at
+  their new place, as Carry Regions Over does (RITM and colour; the outline can shrink or grow). A new outline is
+  used only if it is close to the old one; otherwise the moved outline is kept, and a message says how many
+  outlines were re-fitted.
+- **Undo:** one step per drag, per series of arrow presses and turns on the same regions, per re-fit, and per set of
+  confirmed points.
+
+## Positive/negative clicks tool (RITM)
+- **Correcting a region keeps its information.** Select a region, then add points: before, the corrected region
+  kept only its id and class. It now also keeps its name, note, custom attributes (including the carry-over
+  status), and "to check" mark. DEM metrics and surface area are cleared, because the outline changed.
+- **Corrections need fewer points.** RITM now starts from the region's own outline, plus an automatic point inside
+  it. Before, it started from the outline alone and changed little at the first point. On the Nursery1 test above:
+  0.72 instead of 0.61 after one point, 0.87 instead of 0.82 after two.
+- **Fixes:**
+  - Confirming a correction that found nothing no longer hides the region.
+  - Memory no longer grows with each point during a long session.
 
 ## Dictionaries
 - **`spongenursery.json`** (in the main folder, next to `FDEP.json`): the sponge nursery labels.

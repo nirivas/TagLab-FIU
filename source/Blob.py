@@ -138,6 +138,21 @@ class Blob(object):
 
         return blob
 
+    def inheritInfo(self, old_blob):
+        """
+        This region replaces old_blob with a new outline (re-fit, turn, correction with clicks): it takes its id, class,
+        names, note, genet, attributes and "to check" flag. The DEM metrics are left out: they were measured on the
+        old outline (the surface area is not copied either).
+        """
+        self.setId(old_blob.id)
+        self.version = old_blob.version + 1
+        self.class_name = old_blob.class_name
+        self.instance_name = old_blob.instance_name
+        self.note = old_blob.note
+        self.genet = old_blob.genet
+        self.data = {k: v for k, v in old_blob.data.items() if k not in DEM_METRIC_NAMES}
+        self.correspondence_to_check = old_blob.correspondence_to_check
+
     def __deepcopy__(self, memo):
         #avoid recursion!
         deepcopy_method = self.__deepcopy__

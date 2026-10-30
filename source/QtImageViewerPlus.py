@@ -155,6 +155,7 @@ class QtImageViewerPlus(QtImageViewer):
         self.undo_data = Undo()
         self.last_nudge = None   # undo step of the last move with the arrow keys (the next ones are merged into it)
         self.turn_centre = None  # centre of the last turn with the , and . keys (the next ones turn around it too)
+        self.point_right_press = False  # the last right click was a negative point of the Move Region tool
 
         self.dragSelectionStart = None
         self.dragSelectionRect = None
@@ -1051,7 +1052,13 @@ class QtImageViewerPlus(QtImageViewer):
 
         if event.button() == Qt.RightButton:
             (x, y) = self.clipScenePos(scenePos)
+            self.point_right_press = False
             if self.tools.tool == "RITM" or self.tools.tool == "SAMINTERACTIVE" or self.tools.tool == "WATERSHED":
+                self.tools.rightPressed(x, y, mods)
+
+            elif self.tools.tool == "MOVEREGION" and mods & Qt.ShiftModifier:
+                # negative point: TagLab.openContextMenu opens no menu for it
+                self.point_right_press = True
                 self.tools.rightPressed(x, y, mods)
 
             else:
@@ -1155,9 +1162,14 @@ class QtImageViewerPlus(QtImageViewer):
     def moveRegionKey(self, key, modifiers):
         """
         The keys of the Move Region tool: the arrows move the selected regions by 1 pixel (SHIFT: 10 pixels), , and .
-        turn them by 5 degrees (SHIFT: 90 degrees). Returns whether the key was used.
+        turn them by 5 degrees (SHIFT: 90 degrees). Returns whether the key was used. While the outline is being
+        corrected with points they do nothing (move and turn first, then add the points).
         """
-        if self.tools.tool != "MOVEREGION" or len(self.selected_blobs) == 0:
+        if self.tools.tool != "MOVEREGION":
+            return False
+        if self.tools.tools["MOVEREGION"].hasPoints():
+            return key in self.NUDGE_KEYS or key in self.TURN_KEYS
+        if len(self.selected_blobs) == 0:
             return False
         shift = bool(modifiers & Qt.ShiftModifier)
         if key in self.NUDGE_KEYS:
@@ -1872,14 +1884,7 @@ class QtImageViewerPlus(QtImageViewer):
             if len(regions) == 0:
                 continue
             new_blob = Blob(max(regions, key=lambda r: r.area), left + x0c, top + y0c, 0)
-            new_blob.setId(blob.id)
-            new_blob.version = blob.version + 1
-            new_blob.class_name = blob.class_name
-            new_blob.instance_name = blob.instance_name
-            new_blob.note = blob.note
-            new_blob.genet = blob.genet
-            new_blob.data = {k: v for k, v in blob.data.items() if k not in DEM_METRIC_NAMES}
-            new_blob.correspondence_to_check = blob.correspondence_to_check
+            new_blob.inheritInfo(blob)
             self.updateBlob(blob, new_blob, selected=True, redraw=False)
             result.append(new_blob)
 
@@ -2021,7 +2026,11 @@ class QtImageViewerPlus(QtImageViewer):
         if self.tools.tool == "RITM" and self.tools.tools["RITM"].hasPoints():
             self.tools.tools["RITM"].undo_click()
             return
-        
+
+        if self.tools.tool == "MOVEREGION" and self.tools.tools["MOVEREGION"].hasPoints():
+            self.tools.tools["MOVEREGION"].undo_click()
+            return
+
         if self.tools.tool == "SAMINTERACTIVE" and self.tools.tools["SAMINTERACTIVE"].hasPoints():
             self.tools.tools["SAMINTERACTIVE"].undo_click()
             return
