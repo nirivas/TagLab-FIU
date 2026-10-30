@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButt
     QTableWidgetItem, QHeaderView, QAbstractItemView
 
 from source import CarryOver
+from source import Shortcuts
 
 
 class QtCarryOverReview(QWidget):
@@ -41,6 +42,8 @@ class QtCarryOverReview(QWidget):
         self.removed = set()
         self.ids = []          # target ids of the listed regions, in review order
         self.current = -1
+        # mouse buttons set as shortcuts (TagLab.mouseShortcut(button) runs the action, True if it used the press)
+        self.mouse_shortcut = None
 
         self.summaryLabel = QLabel()
         self.summaryLabel.setWordWrap(True)
@@ -56,36 +59,24 @@ class QtCarryOverReview(QWidget):
         self.table.setStyleSheet("QHeaderView::section { background-color: rgb(55,55,55); color: white }")
         self.table.cellClicked.connect(self.goTo)
 
-        helpLabel = QLabel("Each colony is shown in both maps with its old and new outline selected. Edit it with "
-                           "the usual tools if needed (or change its class, e.g. to a dead-coral class), then keep "
-                           "or remove it. If it landed in the wrong place, Move it (SHIFT + drag or the arrow keys; "
-                           ", and . turn it), then correct its outline with SHIFT + click (positive point) and "
-                           "SHIFT + right click (negative point) and confirm with SPACE, or Re-fit it. "
-                           "Keys: N next, P previous, K keep, Delete remove.")
-        helpLabel.setWordWrap(True)
+        # the texts that name the keys: updateShortcutTexts
+        self.helpLabel = QLabel()
+        self.helpLabel.setWordWrap(True)
 
-        self.btnPrevious = QPushButton("< Previous (P)")
+        self.btnPrevious = QPushButton()
         self.btnPrevious.clicked.connect(self.previous)
-        self.btnNext = QPushButton("Next (N) >")
+        self.btnNext = QPushButton()
         self.btnNext.clicked.connect(self.next)
-        self.btnKeep = QPushButton("Keep (K)")
+        self.btnKeep = QPushButton()
         self.btnKeep.setToolTip("The colony is still there: its status becomes \"kept\".")
         self.btnKeep.clicked.connect(self.keepCurrent)
-        self.btnRemove = QPushButton("Remove (Del)")
+        self.btnRemove = QPushButton()
         self.btnRemove.setToolTip("The colony is gone: the region is deleted from the new map and it becomes "
                                   "\"dead\" in the comparison table.")
         self.btnRemove.clicked.connect(self.removeCurrent)
         self.btnMove = QPushButton("Move / correct")
-        self.btnMove.setToolTip("Select the colony and activate the Move Region tool: SHIFT + drag it, or move it with "
-                                "the arrow keys (SHIFT + arrow: 10 pixels); , and . turn it by 5 degrees (SHIFT: 90 "
-                                "degrees). Then SHIFT + click adds a positive point (part of the colony) and SHIFT + "
-                                "right click a negative point (not part of it): RITM corrects the outline after each "
-                                "point, CTRL + Z removes the last one, SPACE confirms them and ESC cancels them. Its "
-                                "status does not change: press K to keep it.")
         self.btnMove.clicked.connect(self.moveCurrent)
         self.btnRefit = QPushButton("Re-fit outline")
-        self.btnRefit.setToolTip("Fit the outline to the new map with RITM and colour (e.g. after moving it); it can "
-                                 "shrink or grow. Its status does not change: press K to keep it.")
         self.btnRefit.clicked.connect(self.refitCurrent)
         self.btnClose = QPushButton("Close")
         self.btnClose.clicked.connect(self.close)
@@ -105,15 +96,53 @@ class QtCarryOverReview(QWidget):
         layout = QVBoxLayout()
         layout.addWidget(self.summaryLabel)
         layout.addWidget(self.table)
-        layout.addWidget(helpLabel)
+        layout.addWidget(self.helpLabel)
         layout.addLayout(layoutButtons)
         self.setLayout(layout)
 
         # the same keys when this panel has the focus (TagLab handles them when the main window has it); the table
         # would use the letters to jump to a row
         self.table.installEventFilter(self)
+        self.table.viewport().installEventFilter(self)
 
+        self.updateShortcutTexts()
         self.rebuild()
+
+    def updateShortcutTexts(self):
+        """
+        The button labels, the help line and the tooltips with the current keys (File > Keyboard and Mouse Shortcuts).
+        """
+        bindings = Shortcuts.bindings
+
+        def withKey(text, name):
+            key = bindings.describe(name)
+            return text + " (" + key + ")" if key else text
+
+        self.btnPrevious.setText(withKey("< Previous", "review_previous"))
+        self.btnNext.setText(withKey("Next", "review_next") + " >")
+        self.btnKeep.setText(withKey("Keep", "review_keep"))
+        self.btnRemove.setText(withKey("Remove", "review_remove"))
+
+        keys = [bindings.describe(name) + " " + word for name, word in
+                (("review_next", "next"), ("review_previous", "previous"), ("review_keep", "keep"),
+                 ("review_remove", "remove")) if bindings.describe(name)]
+        self.helpLabel.setText("Each colony is shown in both maps with its old and new outline selected. Edit it with "
+                               "the usual tools if needed (or change its class, e.g. to a dead-coral class), then keep "
+                               "or remove it. If it landed in the wrong place, Move it (SHIFT + drag or " +
+                               bindings.moveKeysText() + "; " + bindings.turnKeysText() + " turn it), then correct "
+                               "its outline with SHIFT + click (positive point) and SHIFT + right click (negative "
+                               "point) and confirm with SPACE, or Re-fit it." +
+                               (" Keys: " + ", ".join(keys) + "." if keys else ""))
+
+        keep = "Its status does not change: use " + self.btnKeep.text() + " to keep it."
+        self.btnMove.setToolTip("Select the colony and activate the Move Region tool: SHIFT + drag it, or move it with "
+                                + bindings.moveKeysText() + " (SHIFT: 10 pixels); " + bindings.turnKeysText() +
+                                " turn it by 5 degrees (SHIFT: 90 degrees). Then SHIFT + click adds a positive point "
+                                "(part of the colony) and SHIFT + right click a negative point (not part of it): RITM "
+                                "corrects the outline after each point, CTRL + Z removes the last one, SPACE confirms "
+                                "them and ESC cancels them. " + keep)
+        self.btnRefit.setToolTip("Fit the outline to the new map with RITM and colour (e.g. after moving it); it can "
+                                 "shrink or grow. " + keep)
 
     def rebuild(self):
         """
@@ -245,35 +274,51 @@ class QtCarryOverReview(QWidget):
         if blob is not None:
             self.refitColony.emit(blob.id)
 
-    @staticmethod
-    def plainKey(event):
-        return not int(event.modifiers()) & int(Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier)
-
     def eventFilter(self, obj, event):
-        if obj is self.table and event.type() == QEvent.KeyPress and self.plainKey(event):
-            if self.handleKey(event.key()):
+        if obj is self.table and event.type() == QEvent.KeyPress:
+            if self.handleKeyEvent(event):
+                return True
+        elif obj is self.table.viewport() and event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
+            if self.shortcutPress(event):
                 return True
         return super(QtCarryOverReview, self).eventFilter(obj, event)
 
     def keyPressEvent(self, event):
-        if not (self.plainKey(event) and self.handleKey(event.key())):
+        if not self.handleKeyEvent(event):
             super(QtCarryOverReview, self).keyPressEvent(event)
 
-    def handleKey(self, key):
-        """
-        The review keys (also used by TagLab while this panel is open). Returns True if the key was used.
-        """
-        if key == Qt.Key_N:
-            self.next()
-        elif key == Qt.Key_P:
-            self.previous()
-        elif key == Qt.Key_K:
-            self.keepCurrent()
-        elif key == Qt.Key_Delete:
-            self.removeCurrent()
-        else:
+    def mousePressEvent(self, event):
+        if not self.shortcutPress(event):
+            super(QtCarryOverReview, self).mousePressEvent(event)
+
+    def shortcutPress(self, event):
+        """A mouse button set as a shortcut, pressed on this panel without SHIFT / CTRL / ALT (see TagLab.mouseShortcut)."""
+        if event.button() == Qt.LeftButton or self.mouse_shortcut is None or \
+                int(event.modifiers()) & int(Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier):
             return False
+        return self.mouse_shortcut(event.button())
+
+    def handleKeyEvent(self, event):
+        """
+        The review keys (File > Keyboard and Mouse Shortcuts; TagLab uses them too while this panel is open). Returns
+        True if the key was used.
+        """
+        name = Shortcuts.bindings.actionForKey(event.key(), event.modifiers(), [Shortcuts.REVIEW])
+        if name is None:
+            return False
+        self.run(name)
         return True
+
+    def run(self, name):
+        """Run a review action: review_next, review_previous, review_keep or review_remove."""
+        if name == "review_next":
+            self.next()
+        elif name == "review_previous":
+            self.previous()
+        elif name == "review_keep":
+            self.keepCurrent()
+        elif name == "review_remove":
+            self.removeCurrent()
 
     def closeEvent(self, event):
         self.closed.emit()

@@ -2,6 +2,7 @@ import datetime
 import json
 import csv
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,35 @@ from source.Label import Label
 from source.RegionAttributes import RegionAttributes
 from source.Shape import Layer, Shape
 from source.tools import Cut
+
+def writeTextSafely(filename, text, attempts=5, wait=0.2):
+    """
+    Write text to filename in two steps: the text goes to filename + ".tmp" in the same folder, which then replaces
+    filename at once, so an error or a crash never leaves a cut-off file. A PermissionError on the replace (OneDrive or
+    an antivirus holding the file) is retried. On failure the .tmp is removed, the old file is left as it was, and the
+    error is raised.
+    """
+    tmp = filename + ".tmp"
+    try:
+        # text mode, as before: the same bytes as the old direct write
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(attempts):
+            try:
+                os.replace(tmp, filename)
+                return
+            except PermissionError:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(wait)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 def replacePaths(old_path, new_path, images, taglab_dir):
     """
@@ -327,23 +357,29 @@ class Project(QObject):
         else:
             return list(class_names)
 
-    def save(self, filename=None):
+    def save(self, filename=None, repair=True):
+        """
+        Write the project to filename (default: self.filename), without ever leaving a cut-off file (see
+        writeTextSafely). repair=False skips the table repair, so the project is not changed (autosave).
+        """
+        text = self.toJson(repair)
 
-        # repair inconsistencies (rows naming regions that no longer exist, regions missing from a table)
-        if self.correspondences is not None:
+        if filename is None:
+            filename = self.filename
+        writeTextSafely(filename, text)
+
+    def toJson(self, repair=True):
+
+        # repair inconsistencies (rows naming regions that no longer exist, regions missing from a table); a file saved
+        # without it is repaired when it is loaded (Correspondences.fillTable)
+        if repair and self.correspondences is not None:
             repaired = sum(table.checkTable() for table in self.correspondences.values())
             if repaired > 0:
                 self.updateGenets()
                 self.correspTableChanged.emit()
 
         data = self.__dict__
-        str = json.dumps(data, cls=ProjectEncoder, indent=1)
-
-        if filename is None:
-            filename = self.filename
-        f = open(filename, "w")
-        f.write(str)
-        f.close()
+        return json.dumps(data, cls=ProjectEncoder, indent=1)
 
     # def loadDictionary(self, filename):
     #     """

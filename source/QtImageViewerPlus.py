@@ -35,6 +35,7 @@ from source.Annotation import Blob
 from source.Tools import Tools
 from source.Label import Label
 from source.DemMetrics import DEM_METRIC_NAMES
+from source import Shortcuts
 import source.Mask as Mask
 
 from source.QtImageViewer import QtImageViewer
@@ -151,11 +152,17 @@ class QtImageViewerPlus(QtImageViewer):
         # Message panel for tool instructions and status
         self.toolsMessagePanel = QtToolMessagePanel(self)
         self.toolsMessagePanel.hide()
+        self.show_tool_messages = True   # False: the panel is never shown in this viewer (see showMessage)
 
         self.undo_data = Undo()
         self.last_nudge = None   # undo step of the last move with the arrow keys (the next ones are merged into it)
         self.turn_centre = None  # centre of the last turn with the , and . keys (the next ones turn around it too)
-        self.point_right_press = False  # the last right click was a negative point of the Move Region tool
+        # the last right click was a negative point of the Move Region tool or a shortcut: TagLab opens no region menu
+        self.point_right_press = False
+        # mouse buttons set as shortcuts (File > Keyboard and Mouse Shortcuts): TagLab.mouseShortcut(button) runs the
+        # action and returns True if it used the press
+        self.mouse_shortcut = None
+        self.shortcut_button = None   # the button of the last press used by a shortcut (its release is ignored)
 
         self.dragSelectionStart = None
         self.dragSelectionRect = None
@@ -235,7 +242,9 @@ class QtImageViewerPlus(QtImageViewer):
         self.tools.tools["SELECTAREA"].setWorkingAreaStyle(self.working_area_pen)
 
     def showMessage(self, text, status='info', timeout=None):
-        """Show a message in the integrated message panel."""
+        """Show a message in the integrated message panel (unless show_tool_messages is False)."""
+        if not self.show_tool_messages:
+            return
         self.toolsMessagePanel.showMessage(text, status, timeout)
         self.toolsMessagePanel.updatePosition()
 
@@ -1007,10 +1016,30 @@ class QtImageViewerPlus(QtImageViewer):
 
 ### MOUSE EVENTS
 
+    def shortcutPress(self, event):
+        """
+        A mouse button that is a shortcut (not the left one, pressed without SHIFT / CTRL / ALT): returns True if
+        TagLab used it (the press then does nothing else; after a right press no region menu opens).
+        """
+        self.shortcut_button = None
+        if event.button() == Qt.LeftButton or self.mouse_shortcut is None or \
+                int(event.modifiers()) & int(Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier):
+            return False
+        if not self.mouse_shortcut(event.button()):
+            return False
+        self.shortcut_button = event.button()
+        if event.button() == Qt.RightButton:
+            self.point_right_press = True
+        event.accept()
+        return True
+
     def mousePressEvent(self, event):
         """ Start mouse pan or zoom mode.
         """
         self.activated.emit()
+
+        if self.shortcutPress(event):
+            return
 
         scenePos = self.mapToScene(event.pos())
 
@@ -1069,6 +1098,12 @@ class QtImageViewerPlus(QtImageViewer):
     def mouseReleaseEvent(self, event):
         """ Stop mouse pan or zoom mode (apply zoom if valid).
         """
+        if self.shortcut_button is not None and event.button() == self.shortcut_button:
+            # the press was a shortcut
+            self.shortcut_button = None
+            event.accept()
+            return
+
         QGraphicsView.mouseReleaseEvent(self, event)
 
         scenePos = self.mapToScene(event.pos())
@@ -1139,14 +1174,14 @@ class QtImageViewerPlus(QtImageViewer):
 
     def mouseDoubleClickEvent(self, event):
 
+        # a quick second press of a shortcut button arrives as a double click
+        if self.shortcutPress(event):
+            return
+
         scenePos = self.mapToScene(event.pos())
 
         if event.button() == Qt.LeftButton:
             self.selectOp(scenePos.x(), scenePos.y())
-
-    NUDGE_KEYS = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0), Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
-    # degrees, clockwise on the screen; SHIFT + , and . gives < and > on most keyboards
-    TURN_KEYS = {Qt.Key_Comma: -5, Qt.Key_Period: 5, Qt.Key_Less: -90, Qt.Key_Greater: 90}
 
     def keyPressEvent(self, event):
 
@@ -1161,29 +1196,32 @@ class QtImageViewerPlus(QtImageViewer):
 
     def moveRegionKey(self, key, modifiers):
         """
-        The keys of the Move Region tool: the arrows move the selected regions by 1 pixel (SHIFT: 10 pixels), , and .
-        turn them by 5 degrees (SHIFT: 90 degrees). Returns whether the key was used. While the outline is being
-        corrected with points they do nothing (move and turn first, then add the points).
+        The keys of the Move Region tool (File > Keyboard and Mouse Shortcuts; by default the arrows move the selected
+        regions by 1 pixel, SHIFT: 10 pixels, and , and . turn them by 5 degrees, SHIFT: 90 degrees). Returns whether the
+        key was used.
+        """
+        step = Shortcuts.bindings.moveForKey(key, modifiers)
+        if step is None:
+            return False
+        return self.moveRegionStep(step)
+
+    def moveRegionStep(self, step):
+        """
+        A Move Region step, ("nudge", dx, dy) or ("turn", degrees clockwise), on the selected regions. Returns whether it
+        was used. While the outline is being corrected with points it does nothing (move and turn first, then add the
+        points).
         """
         if self.tools.tool != "MOVEREGION":
             return False
         if self.tools.tools["MOVEREGION"].hasPoints():
-            return key in self.NUDGE_KEYS or key in self.TURN_KEYS
+            return True
         if len(self.selected_blobs) == 0:
             return False
-        shift = bool(modifiers & Qt.ShiftModifier)
-        if key in self.NUDGE_KEYS:
-            dx, dy = self.NUDGE_KEYS[key]
-            step = 10 if shift else 1
-            self.nudgeSelected(dx * step, dy * step)
-            return True
-        if key in self.TURN_KEYS:
-            angle = self.TURN_KEYS[key]
-            if shift and abs(angle) == 5:
-                angle *= 18
-            self.turnSelected(angle)
-            return True
-        return False
+        if step[0] == "nudge":
+            self.nudgeSelected(step[1], step[2])
+        else:
+            self.turnSelected(step[1])
+        return True
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Shift and self.tools.tool == "RITM":

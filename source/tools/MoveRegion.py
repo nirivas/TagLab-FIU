@@ -1,8 +1,10 @@
+import html
 import math
 
 from PyQt5.QtCore import Qt
 
 from source.tools.Tool import Tool
+from source import Shortcuts
 
 
 class MoveRegion(Tool):
@@ -27,19 +29,29 @@ class MoveRegion(Tool):
         self.drag = None        # (x, y where the drag started, regions dragged)
         self.offset = (0, 0)    # current shift of the dragged regions (pixels)
 
+        self.tool_message = self.messageText()
+
+    @staticmethod
+    def messageText():
+        """The instructions, with the keys set in File > Keyboard and Mouse Shortcuts."""
+        bindings = Shortcuts.bindings
+        move_keys = bindings.moveKeysText()
+        move_keys = html.escape(move_keys[0].upper() + move_keys[1:])
         message = "<p><i>Move regions to the right place and correct their outline</i></p>"
         message += "<p>- SHIFT + LMB drag: move the region (or all the selected regions)</p>"
-        message += "<p>- Arrow keys: move the selected regions by 1 pixel (SHIFT + arrow: 10 pixels)</p>"
-        message += "<p>- , and . : turn the selected regions by 5 degrees (SHIFT: 90 degrees)</p>"
+        message += "<p>- " + move_keys + ": move the selected regions by 1 pixel (with SHIFT: 10 pixels)</p>"
+        message += "<p>- " + html.escape(bindings.turnKeysText()) + " : turn the selected regions by 5 degrees " \
+                   "(SHIFT: 90 degrees)</p>"
         message += "<p>- SHIFT + LMB click: positive point (part of the region), SHIFT + RMB: negative point " \
                    "(not part of it); RITM corrects the outline of the selected region. CTRL + Z removes the last " \
                    "point. Move and turn first: they are off while there are points.</p>"
         message += "<p>- SPACEBAR: confirm the points; without points, re-fit the outline of the selected regions " \
                    "to the image (RITM + colour)</p>"
         message += "<p>- ESC: cancel the move or the points in progress</p>"
-        self.tool_message = f'<div style="text-align: left;">{message}</div>'
+        return f'<div style="text-align: left;">{message}</div>'
 
     def activate(self):
+        self.tool_message = self.messageText()
         self.viewerplus.showMessage(self.tool_message)
 
     def deactivate(self):

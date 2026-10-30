@@ -18,12 +18,19 @@
 # for more details.                                               
 
 import os
+import html
 
 from PyQt5.QtCore import Qt, QSize, pyqtSlot, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QIcon, qRgb, qRed, qGreen, qBlue
 from PyQt5.QtWidgets import QWidget, QGroupBox, QGridLayout, QSizePolicy, QLabel, QPushButton, QHBoxLayout, QVBoxLayout
 
 from source.Annotation import Annotation
+from source import Shortcuts
+
+
+def keyLabel(name):
+    """The key (and mouse button) of an action, as set in File > Keyboard and Mouse Shortcuts."""
+    return QLabel("<b>" + html.escape(Shortcuts.bindings.describe(name) or "-") + "</b>")
 
 class QtHelpWidget(QWidget):
 
@@ -46,11 +53,11 @@ class QtHelpWidget(QWidget):
         self.gridlayout1.addWidget(QLabel("Save Project"), 2,0)
         self.gridlayout1.addWidget(QLabel("Save As.."), 3, 0)
         self.gridlayout1.addWidget(QLabel("Load Map"), 4,0)
-        self.gridlayout1.addWidget(QLabel("<b>Ctrl+N</b>"), 0,1)
-        self.gridlayout1.addWidget(QLabel("<b>Ctrl+O</b>"), 1,1)
-        self.gridlayout1.addWidget(QLabel("<b>Ctrl+S</b>"), 2,1)
-        self.gridlayout1.addWidget(QLabel("<b>Ctrl+Alt+S</b>"), 3,1)
-        self.gridlayout1.addWidget(QLabel("<b>Ctrl+L</b>"), 4,1)
+        self.gridlayout1.addWidget(keyLabel("new_project"), 0,1)
+        self.gridlayout1.addWidget(keyLabel("open_project"), 1,1)
+        self.gridlayout1.addWidget(keyLabel("save_project"), 2,1)
+        self.gridlayout1.addWidget(keyLabel("save_as"), 3,1)
+        self.gridlayout1.addWidget(keyLabel("add_map"), 4,1)
         self.groupbox_proj.setLayout(self.gridlayout1)
 
         # self.groupbox_tool = QGroupBox("Tools")
@@ -90,16 +97,16 @@ class QtHelpWidget(QWidget):
         self.gridlayout3.addWidget(QLabel("Refine Border"), 7,0)
         self.gridlayout3.addWidget(QLabel("Dilate Border"), 8, 0)
         self.gridlayout3.addWidget(QLabel("Erode Border"), 9, 0)
-        self.gridlayout3.addWidget(QLabel("<b>A</b>"), 0, 1)
-        self.gridlayout3.addWidget(QLabel("<b>F</b>"), 1, 1)
-        self.gridlayout3.addWidget(QLabel("<b>DEL</b>"), 2, 1)
-        self.gridlayout3.addWidget(QLabel("<b>M</b>"), 3, 1)
-        self.gridlayout3.addWidget(QLabel("<b>D</b>"), 4, 1)
-        self.gridlayout3.addWidget(QLabel("<b>S</b>"), 5, 1)
-        self.gridlayout3.addWidget(QLabel("<b>B</b>"), 6, 1)
-        self.gridlayout3.addWidget(QLabel("<b>R</b>"), 7, 1)
-        self.gridlayout3.addWidget(QLabel("<b>+</b>"), 8, 1)
-        self.gridlayout3.addWidget(QLabel("<b>-</b>"), 9, 1)
+        self.gridlayout3.addWidget(keyLabel("assign"), 0, 1)
+        self.gridlayout3.addWidget(keyLabel("fill"), 1, 1)
+        self.gridlayout3.addWidget(keyLabel("delete"), 2, 1)
+        self.gridlayout3.addWidget(keyLabel("merge"), 3, 1)
+        self.gridlayout3.addWidget(keyLabel("divide"), 4, 1)
+        self.gridlayout3.addWidget(keyLabel("subtract"), 5, 1)
+        self.gridlayout3.addWidget(keyLabel("snap"), 6, 1)
+        self.gridlayout3.addWidget(keyLabel("refine"), 7, 1)
+        self.gridlayout3.addWidget(keyLabel("dilate"), 8, 1)
+        self.gridlayout3.addWidget(keyLabel("erode"), 9, 1)
         self.groupbox_labels.setLayout(self.gridlayout3)
 
         self.groupbox_commands = QGroupBox("Commands")
@@ -117,14 +124,14 @@ class QtHelpWidget(QWidget):
         self.gridlayout4.addWidget(QLabel("Toggle Grid"), 9, 0)
         self.gridlayout4.addWidget(QLabel("<b>Click</b>"), 0, 1)
         self.gridlayout4.addWidget(QLabel("<b>Click + Shift</b>"), 1, 1)
-        self.gridlayout4.addWidget(QLabel("<b>SPACE</b>"), 2, 1)
-        self.gridlayout4.addWidget(QLabel("<b>ESC</b>"), 3, 1)
-        self.gridlayout4.addWidget(QLabel("<b>Ctrl+Z</b>"), 4, 1)
-        self.gridlayout4.addWidget(QLabel("<b>Ctrl+Shift+Z</b>"), 5, 1)
-        self.gridlayout4.addWidget(QLabel("<b>Q</b>"), 6, 1)
-        self.gridlayout4.addWidget(QLabel("<b>W</b>"), 7, 1)
-        self.gridlayout4.addWidget(QLabel("<b>E</b>"), 8, 1)
-        self.gridlayout4.addWidget(QLabel("<b>G</b>"), 9, 1)
+        self.gridlayout4.addWidget(keyLabel("confirm"), 2, 1)
+        self.gridlayout4.addWidget(keyLabel("cancel"), 3, 1)
+        self.gridlayout4.addWidget(keyLabel("undo"), 4, 1)
+        self.gridlayout4.addWidget(keyLabel("redo"), 5, 1)
+        self.gridlayout4.addWidget(keyLabel("toggle_fill"), 6, 1)
+        self.gridlayout4.addWidget(keyLabel("toggle_borders"), 7, 1)
+        self.gridlayout4.addWidget(keyLabel("toggle_ids"), 8, 1)
+        self.gridlayout4.addWidget(keyLabel("toggle_grid"), 9, 1)
 
         self.groupbox_commands.setLayout(self.gridlayout4)
 
@@ -138,6 +145,8 @@ class QtHelpWidget(QWidget):
         #main_layout.addWidget(self.groupbox_tool)
         main_layout.addWidget(self.groupbox_labels)
 
+        lblAll = QLabel("All the keys and mouse buttons: File > Keyboard and Mouse Shortcuts.")
+
         self.btnClose = QPushButton("Close")
         self.btnClose.clicked.connect(self.close)
         buttons_layout = QHBoxLayout()
@@ -146,6 +155,7 @@ class QtHelpWidget(QWidget):
 
         layoutF = QVBoxLayout()
         layoutF.addLayout(main_layout)
+        layoutF.addWidget(lblAll)
         layoutF.addLayout(buttons_layout)
         layoutF.setSpacing(3)
         self.setLayout(layoutF)

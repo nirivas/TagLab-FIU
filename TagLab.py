@@ -31,6 +31,8 @@ import urllib
 import platform
 import pandas as pd
 import importlib
+import time
+import hashlib
 from collections import Counter
 
 from PyQt5.QtCore import Qt, QSize, QMargins, QDir, QPoint, QPointF, QRectF, QTimer, pyqtSlot, pyqtSignal, QSettings, QFileInfo, QModelIndex, \
@@ -69,7 +71,7 @@ from source.QtCarryOverWidget import QtCarryOverWidget
 from source.QtCarryOverReview import QtCarryOverReview
 from source.QtImageViewerPlus import QtImageViewerPlus
 from source.QtMapViewer import QtMapViewer
-from source.QtSettingsWidget import QtSettingsWidget
+from source.QtSettingsWidget import QtSettingsWidget, AUTOSAVE_KEY
 from source.QtMapSettingsWidget import QtMapSettingsWidget
 from source.QtScaleWidget import QtScaleWidget
 from source.QtWorkingAreaWidget import QtWorkingAreaWidget
@@ -77,6 +79,8 @@ from source.QtCropWidget import QtCropWidget
 from source.QtLayersWidget import QtLayersWidget
 
 from source.QtHelpWidget import QtHelpWidget
+from source.QtShortcutsWidget import QtShortcutsWidget
+from source import Shortcuts
 
 from source.QtProgressBarCustom import QtProgressBarCustom
 from source.QtHistogramWidget import QtHistogramWidget
@@ -94,7 +98,7 @@ from source.QtExportAnnAsTable import QtExportAnnAsTable
 from source.QtTableLabel import QtTableLabel
 from source.QtProjectWidget import QtProjectWidget
 from source.QtProjectEditor import QtProjectEditor
-from source.Project import Project, loadProject
+from source.Project import Project, loadProject, writeTextSafely
 from source.Point import Point
 from source.Image import Image
 from source.MapClassifier import MapClassifier
@@ -281,9 +285,15 @@ class TagLab(QMainWindow):
         self.newDatasetWidget = None
         self.help_widget = None
 
+        # keyboard and mouse shortcuts (File > Keyboard and Mouse Shortcuts; source/Shortcuts.py)
+        Shortcuts.bindings.load()
+        self.shortcut_actions = {}       # shortcut id -> menu QAction (its key is the QAction shortcut)
+        self.suspended_shortcuts = []    # menu shortcuts switched off while the review panel is open
+
         # carry-over (Compare > Carry Regions Over)
         self.background_worker = None
         self.background_progress = None
+        self.classifier_progress = None
         self.carryover_review = None
         self.carryover_reasons = {}   # image id -> {region id: reasons}, for the review panel (not saved)
         self.ritm_refit = None        # RITM network of the Move Region tool's re-fit (freed when the tool changes)
@@ -421,6 +431,14 @@ class TagLab(QMainWindow):
         self.selectByWorkingAreaAction = self.newAction("Select by Working Area",        "", self.selectByWorkingArea)
         self.selectByPropertiesAction  = self.newAction("Select by Properties",          "", self.selectByProperties)
 
+        self.shortcut_actions.update({"assign": self.assignAction, "delete": self.deleteAction,
+                                      "merge": self.mergeAction, "divide": self.divideAction,
+                                      "subtract": self.subtractAction, "refine": self.refineAction,
+                                      "dilate": self.dilateAction, "erode": self.erodeAction,
+                                      "snap": self.attachBoundariesAction, "fill": self.fillAction,
+                                      "background_region": self.createNegative, "select_all": self.selectAllAction,
+                                      "select_none": self.selectNoneAction, "select_invert": self.selectInvertAction})
+
         # VIEWERPLUS
 
         # main viewer
@@ -436,6 +454,8 @@ class TagLab(QMainWindow):
 
         # secondary viewer in SPLIT MODE
         self.viewerplus2 = QtImageViewerPlus(self.taglab_dir)
+        # each viewer runs its own copy of the current tool: its instructions are shown once, on the left map
+        self.viewerplus2.show_tool_messages = False
         self.viewerplus2.logfile = logfile
         self.viewerplus2.viewUpdated.connect(self.updateViewInfo, type=Qt.UniqueConnection)
         self.viewerplus2.activated.connect(self.setActiveViewer)
@@ -743,6 +763,25 @@ class TagLab(QMainWindow):
 
         self.setMenuBar(self.createMenuBar())
 
+        # the actions of the keys that are not menu shortcuts (TagLab.runShortcut)
+        self.shortcut_commands = {
+            "confirm": self.confirmOperation, "cancel": self.cancelOperation, "switch_channel": self.switch,
+            "toggle_fill": self.toggleFillShortcut, "toggle_borders": self.toggleBordersShortcut,
+            "toggle_ids": self.toggleIdsShortcut, "toggle_grid": self.toggleGridShortcut,
+            "grid_cell": self.updateGridCellShortcut, "tool_pan": self.move, "tool_fourclicks": self.fourClicks,
+            "tool_ritm": self.ritm, "tool_freehand": self.freehandSegmentation, "tool_assign": self.assign,
+            "tool_editborder": self.editBorder, "tool_cut": self.cut, "tool_crack": self.createCrack,
+            "tool_ruler": self.ruler, "classifier": self.selectClassifier, "tool_moveregion": self.moveRegion,
+            "tool_point": self.placeAnnPoint, "tool_watershed": self.watershedSegmentation,
+            "tool_saminteractive": self.saminteractive, "tool_sam": self.sam, "tool_match": self.matchTool}
+        # the region actions are disabled when no region is selected (updateEditActions): their key then reaches
+        # keyPressEvent, which runs these as before (e.g. Assign and Delete work on selected annotation points)
+        self.shortcut_fallbacks = {
+            "assign": self.assignOperation, "delete": self.deleteSelectedBlobs, "merge": self.union,
+            "divide": self.divide, "subtract": self.subtract, "refine": self.refineBorder, "dilate": self.dilate,
+            "erode": self.erode, "snap": self.attachBoundaries, "fill": self.fillLabel}
+        self.applyShortcuts()
+
         self.setProjectTitle("NONE")
 
         ##### FURTHER INITIALIZAION #####
@@ -785,6 +824,10 @@ class TagLab(QMainWindow):
         self.viewerplus.customContextMenuRequested.connect(self.openContextMenu)
         self.viewerplus2.customContextMenuRequested.connect(self.openContextMenu)
 
+        # mouse buttons set as shortcuts (File > Keyboard and Mouse Shortcuts)
+        self.viewerplus.mouse_shortcut = self.mouseShortcut
+        self.viewerplus2.mouse_shortcut = self.mouseShortcut
+
         self.settings_widget.loadSettings()
 
         # SWITCH IMAGES
@@ -813,6 +856,14 @@ class TagLab(QMainWindow):
 
         # autosave timer
         self.timer = QTimer(self)
+        self.timer.timeout.connect(self.autosave)
+        # one retry when an autosave finds TagLab busy (see autosave)
+        self.autosave_retry = QTimer(self)
+        self.autosave_retry.setSingleShot(True)
+        self.autosave_retry.timeout.connect(self.autosave)
+        self.autosave_hashes = {}        # autosave file -> hash of the text last written there
+        self.autosave_postponed = False  # the postponement is logged once
+        self.autosave_warned = False     # a failure is shown once, until an autosave works again
 
         self.updateToolStatus()
 
@@ -861,7 +912,7 @@ class TagLab(QMainWindow):
         research_field = settings.value("research-field", defaultValue="Marine Ecology", type=str)
         self.researchFieldChanged(research_field)
 
-        interval = settings.value("autosave-interval", type=int, defaultValue=0)
+        interval = settings.value(AUTOSAVE_KEY, type=int, defaultValue=0)
         self.setAutosave(interval)
 
         # drawing preferences
@@ -1006,22 +1057,79 @@ class TagLab(QMainWindow):
         """
 
         if interval > 0:
-
-            # disconnect, just in case..
-            try:
-                self.timer.timeout.disconnect()
-            except:
-                pass
-
-            self.timer.timeout.connect(self.autosave)
-            self.timer.start(interval * 60 * 1000)   # interval is in seconds
+            self.timer.start(interval * 60 * 1000)   # (re)starts the timer, in ms
         else:
             self.timer.stop()
+            self.autosave_retry.stop()
+
+    AUTOSAVE_RETRY_MS = 30 * 1000
+
+    def autosaveBusy(self):
+        """
+        Why an autosave should wait now, or None: a modal window is open (the progress window of a background job,
+        a message, a dialog), a mouse button is held, or a long operation shows the progress bar.
+        """
+        if QApplication.activeModalWidget() is not None:
+            return "a window is open"
+        if QApplication.mouseButtons() != Qt.NoButton:
+            return "a mouse button is held"
+        if self.progress_bar is not None and self.progress_bar.isVisible():
+            return "an operation is running"
+        if self.background_worker is not None or self.classifier_progress is not None:
+            return "a background job is running"
+        return None
 
     @pyqtSlot()
     def autosave(self):
-        filename, file_extension = os.path.splitext(self.project.filename)
-        self.project.save(filename + "_autosave.json")
+        """
+        Save a copy of the project to <project>_autosave.json; the project file itself is never touched.
+        - Skipped while the project has no file; retried 30 s later while TagLab is busy (autosaveBusy).
+        - The project is not changed (no table repair, Project.toJson(repair=False)), and the file is written only if
+          the project changed since the last autosave.
+        - Errors are logged and shown once (non-modal); TagLab carries on and the next autosave tries again.
+        """
+        if self.project is None or not self.project.filename:
+            logfile.info("[AUTOSAVE] Skipped: the project has not been saved to a file yet.")
+            return
+
+        busy = self.autosaveBusy()
+        if busy is not None:
+            if not self.autosave_postponed:
+                logfile.info("[AUTOSAVE] Postponed: " + busy + ".")
+                self.autosave_postponed = True
+            self.autosave_retry.start(self.AUTOSAVE_RETRY_MS)
+            return
+        self.autosave_postponed = False
+        self.autosave_retry.stop()
+
+        # an opened autosave file is autosaved onto itself (not to _autosave_autosave.json)
+        base, _ = os.path.splitext(self.project.filename)
+        if not base.endswith("_autosave"):
+            base += "_autosave"
+        filename = base + ".json"
+
+        try:
+            start = time.time()
+            text = self.project.toJson(repair=False)
+            digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+            if self.autosave_hashes.get(filename) == digest and os.path.exists(filename):
+                return
+            writeTextSafely(filename, text)
+            self.autosave_hashes[filename] = digest
+            self.autosave_warned = False
+            logfile.info("[AUTOSAVE] Saved {:s} ({:.1f} s).".format(filename, time.time() - start))
+        except Exception as e:
+            logfile.exception("[AUTOSAVE] Failed to write " + filename)
+            if not self.autosave_warned:
+                self.autosave_warned = True
+                box = QMessageBox(self)
+                box.setWindowTitle(self.TAGLAB_VERSION)
+                box.setIcon(QMessageBox.Warning)
+                box.setText("Autosave could not write " + filename + ":\n" + str(e) + "\n\nTagLab will try again at "
+                            "the next autosave. Your project file is not affected: use File > Save as usual.")
+                box.setWindowModality(Qt.NonModal)
+                box.setAttribute(Qt.WA_DeleteOnClose)
+                box.show()
 
     # call by pressing right button
     def openContextMenu(self, position):
@@ -1230,6 +1338,10 @@ class TagLab(QMainWindow):
         settingsAct.setStatusTip("")
         settingsAct.triggered.connect(self.settings)
 
+        shortcutsAct = QAction("Keyboard and Mouse Shortcuts...", self)
+        shortcutsAct.setStatusTip("Change the keys and the mouse buttons of the commands")
+        shortcutsAct.triggered.connect(self.openShortcutsEditor)
+
         undoAct = QAction("Undo", self)
         undoAct.setShortcut('Ctrl+Z')
         undoAct.setStatusTip("Undo")
@@ -1302,6 +1414,7 @@ class TagLab(QMainWindow):
         self.submenuExport.addAction(exportTrainingDatasetAct)
         self.filemenu.addSeparator()
         self.filemenu.addAction(settingsAct)
+        self.filemenu.addAction(shortcutsAct)
 
         #### PROJECT MENU
 
@@ -1438,6 +1551,11 @@ class TagLab(QMainWindow):
         splitScreenAction.setShortcut('Alt+S')
         splitScreenAction.setStatusTip("Split screen")
         splitScreenAction.triggered.connect(self.toggleComparison)
+
+        self.shortcut_actions.update({"new_project": newAct, "open_project": openAct, "save_project": saveAct,
+                                      "save_as": saveAsAct, "add_map": newMapAct, "maps_editor": projectEditorAct,
+                                      "undo": undoAct, "redo": redoAct, "help": helpAct,
+                                      "split_screen": splitScreenAction})
 
         autoMatchLabels = QAction("Compute Automatic Matches", self)
         autoMatchLabels.setStatusTip("Match labels between two maps automatically")
@@ -2017,167 +2135,23 @@ class TagLab(QMainWindow):
 
         logfile.info(msg)
 
-        # while the review panel of the carried-over colonies is open: N next, P previous, K keep (Delete: see
+        # while the review panel of the carried-over colonies is open its keys come first (Delete Region: see
         # deleteSelectedBlobs)
-        if self.carryover_review is not None and self.carryover_review.isVisible() and \
-                not int(modifiers) & int(Qt.ControlModifier | Qt.AltModifier):
-            if event.key() in (Qt.Key_N, Qt.Key_P, Qt.Key_K):
-                self.carryover_review.handleKey(event.key())
+        if self.carryover_review is not None and self.carryover_review.isVisible():
+            name = Shortcuts.bindings.actionForKey(event.key(), event.modifiers(), [Shortcuts.REVIEW])
+            if name is not None:
+                self.carryover_review.run(name)
                 return
 
+        # the keys that are not menu shortcuts, and the menu keys whose QAction is disabled (see shortcut_fallbacks)
+        command = Shortcuts.bindings.actionForKey(event.key(), event.modifiers(), [Shortcuts.COMMAND,
+                                                                                    Shortcuts.QACTION])
+
         if event.key() == Qt.Key_Escape:
-            for viewer in (self.viewerplus, self.viewerplus2):
+            self.cancelOperation()
 
-                # RESET CURRENT OPERATION
-                viewer.resetSelection()
-                viewer.resetTools()
-
-                message = "[TOOL][" + viewer.tools.tool + "] Current operation has been canceled."
-                logfile.info(message)
-
-        elif event.key() == Qt.Key_S and modifiers & Qt.ControlModifier:
-            self.save()
-
-        elif event.key() == Qt.Key_S and modifiers & Qt.AltModifier:
-
-            if self.split_screen_flag is True:
-                self.disableSplitScreen()
-            else:
-                self.enableSplitScreen()
-
-        elif event.key() == Qt.Key_A:
-            self.assignOperation()
-
-        elif event.key() == Qt.Key_Delete:
-            self.deleteSelectedBlobs()
-
-        elif event.key() == Qt.Key_X:
-
-            pass
-
-        elif event.key() == Qt.Key_B:
-            self.attachBoundaries()
-
-        elif event.key() == Qt.Key_M:
-            # MERGE OVERLAPPED BLOBS
-            self.union()
-
-        elif event.key() == Qt.Key_C:
-            # TOGGLE RGB/DEPTH CHANNELS
-            self.switch()
-
-        elif event.key() == Qt.Key_S:
-            # SUBTRACTION BETWEEN TWO BLOBS (A = A / B), THEN BLOB B IS DELETED
-            self.subtract()
-
-        elif event.key() == Qt.Key_D:
-            # SUBTRACTION BETWEEN TWO BLOBS (A = A / B), BLOB B IS NOT DELETED
-            self.divide()
-
-        elif event.key() == Qt.Key_R:
-            self.refineBorder()
-
-        elif event.key() == Qt.Key_Plus:
-            self.dilate()
-            # self.refineBorderDilate()
-
-        elif event.key() == Qt.Key_Minus:
-            self.erode()
-            # self.refineBorderDilate()
-
-        elif event.key() == Qt.Key_F:
-            self.fillLabel()
-
-        elif event.key() == Qt.Key_U:
-
-            # update grid cell state
-            if self.btnGrid.isChecked():
-                pos = self.cursor().pos()
-                self.activeviewer.updateCellState(pos.x(), pos.y(), None)
-
-        elif event.key() == Qt.Key_1:
-            # ACTIVATE "MOVE" TOOL
-            self.move()
-
-        elif event.key() == Qt.Key_2:
-            # ACTIVATE "4-CLICK" TOOL
-            self.fourClicks()
-
-        elif event.key() == Qt.Key_3:
-            # ACTIVATE "POSITIVE/NEGATIVE CLICK" TOOL
-            self.ritm()
-
-        elif event.key() == Qt.Key_4:
-            # ACTIVATE "FREEHAND" TOOL
-            self.freehandSegmentation()
-
-        elif event.key() == Qt.Key_5:
-            # ACTIVATE "ASSIGN" TOOL
-            self.assign()
-
-        elif event.key() == Qt.Key_6:
-            # ACTIVATE "EDIT BORDER" TOOL
-            self.editBorder()
-
-        elif event.key() == Qt.Key_7:
-            # ACTIVATE "CUT SEGMENTATION" TOOL
-            self.cut()
-
-        elif event.key() == Qt.Key_8:
-            # ACTIVATE "CREATE CRACK" TOOL
-            self.createCrack()
-
-        elif event.key() == Qt.Key_9:
-            # ACTIVATE "RULER" TOOL
-            self.ruler()
-
-        elif event.key() == Qt.Key_0:
-            # FULLY AUTOMATIC SEGMENTATION
-            self.selectClassifier()
-
-        elif event.key() == Qt.Key_Q:
-            # toggle fill
-            if self.checkBoxFill.isChecked():
-               self.viewerplus.toggleFill(1)
-               self.viewerplus2.toggleFill(1)
-               self.checkBoxFill.setChecked(False)
-            else:
-                self.viewerplus.toggleFill(0)
-                self.viewerplus2.toggleFill(0)
-                self.checkBoxFill.setChecked(True)
-
-        elif event.key() == Qt.Key_W:
-            # toggle boundaries
-            if self.checkBoxBorders.isChecked():
-               self.viewerplus.toggleBorders(1)
-               self.viewerplus2.toggleBorders(1)
-               self.checkBoxBorders.setChecked(False)
-            else:
-                self.viewerplus.toggleBorders(0)
-                self.viewerplus2.toggleBorders(0)
-                self.checkBoxBorders.setChecked(True)
-
-        elif event.key() == Qt.Key_E:
-            # toggle regions ids
-            if self.checkBoxIds.isChecked():
-                self.viewerplus.toggleIds(1)
-                self.viewerplus2.toggleIds(1)
-                self.checkBoxIds.setChecked(False)
-            else:
-                self.viewerplus.toggleIds(0)
-                self.viewerplus2.toggleIds(0)
-                self.checkBoxIds.setChecked(True)
-
-        elif event.key() == Qt.Key_G:
-            # toggle grid
-            if self.checkBoxGrid.isChecked():
-               self.viewerplus.toggleGrid(1)
-               self.viewerplus2.toggleGrid(1)
-               self.checkBoxGrid.setChecked(False)
-            else:
-                self.viewerplus.toggleGrid(0)
-                self.viewerplus2.toggleGrid(0)
-                self.checkBoxGrid.setChecked(True)
+        elif event.key() == Qt.Key_Space:
+            self.confirmOperation()
 
         elif event.key() == Qt.Key_Home:
             # ASSIGN LABEL
@@ -2202,24 +2176,186 @@ class TagLab(QMainWindow):
             active_annotations.refine_conservative *= 1.1
             print("Conservative: " + str(active_annotations.refine_conservative))
 
-        elif event.key() == Qt.Key_Space:
-            if self.activeviewer.tools.tool == "MATCH":
-                self.createMatch()
-            elif self.activeviewer.tools.tool == "MOVEREGION":
-                tool = self.activeviewer.tools.tools["MOVEREGION"]
-                if tool.hasPoints():
-                    # the outline corrected with the positive/negative points
-                    tool.confirmPoints()
-                    if self.carryover_review is not None:
-                        self.carryover_review.refresh()
-                else:
-                    self.refitSelectedRegions()
-            else:
-                self.activeviewer.tools.applyTool()
+        elif command is not None:
+            self.runShortcut(command)
 
         elif self.activeviewer is not None and self.activeviewer.moveRegionKey(event.key(), event.modifiers()):
             # the Move Region keys (arrows, turn) when the map does not have the focus
             pass
+
+    def cancelOperation(self):
+        """ESC: cancel the operation in progress in both maps."""
+        for viewer in (self.viewerplus, self.viewerplus2):
+
+            # RESET CURRENT OPERATION
+            viewer.resetSelection()
+            viewer.resetTools()
+
+            message = "[TOOL][" + viewer.tools.tool + "] Current operation has been canceled."
+            logfile.info(message)
+
+    def confirmOperation(self):
+        """SPACE: confirm the operation of the current tool."""
+        if self.activeviewer.tools.tool == "MATCH":
+            self.createMatch()
+        elif self.activeviewer.tools.tool == "MOVEREGION":
+            tool = self.activeviewer.tools.tools["MOVEREGION"]
+            if tool.hasPoints():
+                # the outline corrected with the positive/negative points
+                tool.confirmPoints()
+                if self.carryover_review is not None:
+                    self.carryover_review.refresh()
+            else:
+                self.refitSelectedRegions()
+        else:
+            self.activeviewer.tools.applyTool()
+
+    def toggleFillShortcut(self):
+        # toggle fill
+        if self.checkBoxFill.isChecked():
+           self.viewerplus.toggleFill(1)
+           self.viewerplus2.toggleFill(1)
+           self.checkBoxFill.setChecked(False)
+        else:
+            self.viewerplus.toggleFill(0)
+            self.viewerplus2.toggleFill(0)
+            self.checkBoxFill.setChecked(True)
+
+    def toggleBordersShortcut(self):
+        # toggle boundaries
+        if self.checkBoxBorders.isChecked():
+           self.viewerplus.toggleBorders(1)
+           self.viewerplus2.toggleBorders(1)
+           self.checkBoxBorders.setChecked(False)
+        else:
+            self.viewerplus.toggleBorders(0)
+            self.viewerplus2.toggleBorders(0)
+            self.checkBoxBorders.setChecked(True)
+
+    def toggleIdsShortcut(self):
+        # toggle regions ids
+        if self.checkBoxIds.isChecked():
+            self.viewerplus.toggleIds(1)
+            self.viewerplus2.toggleIds(1)
+            self.checkBoxIds.setChecked(False)
+        else:
+            self.viewerplus.toggleIds(0)
+            self.viewerplus2.toggleIds(0)
+            self.checkBoxIds.setChecked(True)
+
+    def toggleGridShortcut(self):
+        # toggle grid
+        if self.checkBoxGrid.isChecked():
+           self.viewerplus.toggleGrid(1)
+           self.viewerplus2.toggleGrid(1)
+           self.checkBoxGrid.setChecked(False)
+        else:
+            self.viewerplus.toggleGrid(0)
+            self.viewerplus2.toggleGrid(0)
+            self.checkBoxGrid.setChecked(True)
+
+    def updateGridCellShortcut(self):
+        # update grid cell state
+        if self.btnGrid.isChecked():
+            pos = self.cursor().pos()
+            self.activeviewer.updateCellState(pos.x(), pos.y(), None)
+
+    def runShortcut(self, name):
+        """
+        Run the action of a key or mouse shortcut (source/Shortcuts.py). Returns False if it can't be used now.
+        """
+        kind = Shortcuts.KIND[name]
+        if kind == Shortcuts.QACTION:
+            action = self.shortcut_actions.get(name)
+            if action is not None and action.isEnabled():
+                action.trigger()
+            elif name in self.shortcut_fallbacks:
+                self.shortcut_fallbacks[name]()
+            else:
+                return False
+        elif kind == Shortcuts.REVIEW:
+            review = self.carryover_review
+            if review is None or not review.isVisible():
+                return False
+            review.run(name)
+        elif kind == Shortcuts.MOVE:
+            viewer = self.activeviewer
+            if viewer is None or not viewer.moveRegionStep(Shortcuts.Bindings.moveStep(name)):
+                return False
+        else:
+            self.shortcut_commands[name]()
+        return True
+
+    def mouseShortcut(self, button):
+        """
+        A mouse button pressed without SHIFT / CTRL / ALT on a map or on the review panel: run the action it is set to
+        (File > Keyboard and Mouse Shortcuts). The review actions come first (while the panel is open), then the Move
+        Region ones (Move Region tool with selected regions), then the others. Returns False if the button has no action
+        that can be used now: it then does what it does without a shortcut (the right button opens the region menu).
+        """
+        for kinds in ([Shortcuts.REVIEW], [Shortcuts.MOVE], Shortcuts.GLOBAL_KINDS):
+            name = Shortcuts.bindings.actionForMouse(button, kinds)
+            if name is not None and self.runShortcut(name):
+                logfile.info("[SHORTCUT] " + Shortcuts.MOUSE_TEXT[Shortcuts.mouseName(button)] + ": " +
+                             Shortcuts.LABEL[name])
+                return True
+        return False
+
+    def applyShortcuts(self):
+        """
+        Use the shortcuts of source/Shortcuts.py: the keys of the menu actions and the texts that name the keys.
+        """
+        bindings = Shortcuts.bindings
+        self.suspended_shortcuts = []
+        for name, action in self.shortcut_actions.items():
+            action.setShortcut(bindings.keySequence(name))
+        if self.carryover_review is not None:
+            self.suspendShortcutsForReview()
+            self.carryover_review.updateShortcutTexts()
+        self.btnMoveRegion.setToolTip("Move region (SHIFT + drag or " + bindings.moveKeysText() +
+                                      "; SPACE re-fits the outline)")
+        # the Move Region instructions name its keys
+        if self.viewerplus.tools.tool == "MOVEREGION":
+            self.viewerplus.tools.tools["MOVEREGION"].activate()
+        if self.help_widget is not None:
+            self.help_widget.close()
+            self.help_widget = None
+
+    def suspendShortcutsForReview(self):
+        """
+        While the review panel is open its keys come first: the menu shortcuts with the same key are switched off, except
+        Delete Region (deleteSelectedBlobs sends it to the panel when the colony under review is selected).
+        """
+        self.restoreReviewShortcuts()
+        bindings = Shortcuts.bindings
+        review_keys = {bindings.keys[name] for name in Shortcuts.IDS if Shortcuts.KIND[name] == Shortcuts.REVIEW}
+        review_keys.discard(0)
+        for name, action in self.shortcut_actions.items():
+            if name != "delete" and bindings.keys[name] in review_keys:
+                action.setShortcut(QKeySequence())
+                self.suspended_shortcuts.append(name)
+
+    def restoreReviewShortcuts(self):
+        for name in self.suspended_shortcuts:
+            self.shortcut_actions[name].setShortcut(Shortcuts.bindings.keySequence(name))
+        self.suspended_shortcuts = []
+
+    @pyqtSlot()
+    def openShortcutsEditor(self):
+        """
+        File > Keyboard and Mouse Shortcuts: edit, save and use the keys and mouse buttons.
+        """
+        dialog = QtShortcutsWidget(Shortcuts.bindings, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        Shortcuts.bindings.setFrom(dialog.bindings)
+        try:
+            Shortcuts.bindings.save()
+        except Exception:
+            logfile.exception("[SHORTCUTS] Could not save the shortcuts.")
+        self.applyShortcuts()
+        logfile.info("[SHORTCUTS] Shortcuts changed (" + ("defaults" if Shortcuts.bindings.isDefault() else
+                                                          "customized") + ").")
 
 
     def setBlobVisualization(self):
@@ -6746,9 +6882,10 @@ class TagLab(QMainWindow):
         review.moveColony[int].connect(self.moveCarriedColony)
         review.refitColony[int].connect(self.refitCarriedColony)
         review.closed.connect(self.carryOverReviewClosed)
+        review.mouse_shortcut = self.mouseShortcut
         self.carryover_review = review
-        # N is the shortcut of Regions > Create a Background Region: while reviewing it means "next colony"
-        self.createNegative.setShortcut(QKeySequence())
+        # e.g. N is the shortcut of Regions > Create a Background Region: while reviewing it means "next colony"
+        self.suspendShortcutsForReview()
         review.show()
         review.next()
 
@@ -6757,13 +6894,13 @@ class TagLab(QMainWindow):
             review = self.carryover_review
             self.carryover_review = None
             review.close()
-        self.createNegative.setShortcut(QKeySequence("N"))
+        self.restoreReviewShortcuts()
 
     @pyqtSlot()
     def carryOverReviewClosed(self):
         if self.sender() is self.carryover_review:
             self.carryover_review = None
-            self.createNegative.setShortcut(QKeySequence("N"))
+            self.restoreReviewShortcuts()
 
     def carryOverReviewPair(self):
         """
@@ -7047,9 +7184,6 @@ class TagLab(QMainWindow):
 
         self.updateImageSelectionMenu()
 
-        if self.timer is None:
-            self.activateAutosave()
-
         message = "[PROJECT] The project " + self.project.filename + " has been loaded."
         logfile.info(message)
         self.updateToolStatus()
@@ -7100,11 +7234,10 @@ class TagLab(QMainWindow):
         Save the current project.
         """
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.project.save()
-        QApplication.restoreOverrideCursor()
-
-        if self.timer is None:
-            self.activateAutosave()
+        try:
+            self.project.save()
+        finally:
+            QApplication.restoreOverrideCursor()
 
         msgBox = QMessageBox()
         msgBox.setWindowTitle(self.TAGLAB_VERSION)

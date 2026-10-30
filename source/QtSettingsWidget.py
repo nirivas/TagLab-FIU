@@ -24,6 +24,10 @@ from PyQt5.QtGui import QIntValidator
 from PyQt5.QtWidgets import QWidget, QColorDialog, QListWidget, QStackedWidget, QComboBox, QSizePolicy, QLineEdit, \
     QLabel, QSpinBox, QCheckBox, QPushButton, QHBoxLayout, QVBoxLayout, QFileDialog
 
+# autosave interval in minutes, 0 = off. This copy has its own key: the official TagLab shares these settings and
+# writes 0 to its "autosave-interval" key every time it starts.
+AUTOSAVE_KEY = "lab-autosave-minutes"
+
 class generalSettingsWidget(QWidget):
 
     researchFieldChanged = pyqtSignal(str)
@@ -106,7 +110,7 @@ class generalSettingsWidget(QWidget):
             self.spinbox_autosave_interval.setDisabled(True)
             self.lbl_autosave_2.setDisabled(True)
 
-            self.settings.setValue("autosave-interval", 0)
+            self.settings.setValue(AUTOSAVE_KEY, 0)
 
             self.autosaveInfoChanged.emit(0)  # 0 means that the autosave should be disabled
         else:
@@ -114,14 +118,14 @@ class generalSettingsWidget(QWidget):
             self.spinbox_autosave_interval.setEnabled(True)
             self.lbl_autosave_2.setEnabled(True)
 
-            self.settings.setValue("autosave-interval", self.spinbox_autosave_interval.value())
+            self.settings.setValue(AUTOSAVE_KEY, self.spinbox_autosave_interval.value())
 
             self.autosaveInfoChanged.emit(self.spinbox_autosave_interval.value())
 
     @pyqtSlot(int)
     def autosaveIntervalChanged(self, value):
 
-        self.settings.setValue("autosave-interval", self.spinbox_autosave_interval.value())
+        self.settings.setValue(AUTOSAVE_KEY, self.spinbox_autosave_interval.value())
 
         self.autosaveInfoChanged.emit(value)
 
@@ -141,26 +145,31 @@ class generalSettingsWidget(QWidget):
         return self.comboResearchField.currentText()
 
     def setAutosaveInterval(self, interval):
+        """
+        Show the stored interval (minutes, 0 = off). Signals are blocked: TagLab reads the setting itself at start.
+        """
+        enabled = interval > 0
 
-        if interval == 0:
-            self.checkbox_autosave.setChecked(False)
-            self.lbl_autosave_1.setDisabled(True)
-            self.spinbox_autosave_interval.setDisabled(True)
-            self.lbl_autosave_2.setDisabled(True)
-        else:
-            self.checkbox_autosave.setChecked(True)
-            self.lbl_autosave_1.setEnabled(True)
-            self.spinbxo_autosave_interval.setEnabled(True)
-            self.lbl_autosave_2.setEnabled(True)
+        self.checkbox_autosave.blockSignals(True)
+        self.spinbox_autosave_interval.blockSignals(True)
+        self.checkbox_autosave.setChecked(enabled)
+        if enabled:
+            self.spinbox_autosave_interval.setValue(interval)
+        self.checkbox_autosave.blockSignals(False)
+        self.spinbox_autosave_interval.blockSignals(False)
 
-        self.settings.setValue("autosave-interval", interval)
+        self.lbl_autosave_1.setEnabled(enabled)
+        self.spinbox_autosave_interval.setEnabled(enabled)
+        self.lbl_autosave_2.setEnabled(enabled)
+
+        self.settings.setValue(AUTOSAVE_KEY, interval)
 
     def autosaveInterval(self):
 
         if not self.checkbox_autosave.isChecked():
             return 0
         else:
-            return self.edit_autosave_interval.text().toInt()
+            return self.spinbox_autosave_interval.value()
 
 
 class drawingSettingsWidget(QWidget):
@@ -522,8 +531,8 @@ class QtSettingsWidget(QWidget):
 
     def loadSettings(self):
 
-        # 0: autosave is disabled , >0: the project is saved every N seconds
-        self.autosave_interval = self.settings.value("autosave", defaultValue=0, type=int)
+        # 0: autosave is disabled , >0: the project is saved every N minutes
+        self.autosave_interval = self.settings.value(AUTOSAVE_KEY, defaultValue=0, type=int)
         self.research_field = self.settings.value("research-field", defaultValue="Marine Ecology/Biology", type=str)
         self.default_dictionary = self.settings.value("default-dictionary", defaultValue="dictionaries/scripps.json", type=str)
 

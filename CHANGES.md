@@ -23,6 +23,22 @@ under the same GPL-3 licence. It changes the following.
 - **Custom attributes:** looking at a colony in the info panel no longer rounds its stored values.
 - **Region names:** editing a region (Edit Border, merge, subtract, dilate, erode, crack and others) no longer resets
   its name.
+- **Saving:** the project is first written to a temporary file next to it, which then replaces the project file in
+  one step. An error or a crash during Save (a full disk, OneDrive holding the file) can no longer leave a cut-off
+  project file: the previous version stays intact.
+- **Autosave** (File > Settings.., every 1–15 minutes). It writes `<project>_autosave.json` next to the project and
+  never touches the project file itself.
+  - **No more crashes.** In the official TagLab, autosave closed TagLab when the project had not been saved to a file
+    yet, or when the file could not be written (for example a project in a OneDrive folder while it syncs).
+  - **It waits while TagLab is busy** (a progress window, a message, a held mouse button, a running job) and saves 30
+    seconds later.
+  - **It doesn't change the project, and writes only when something changed.** The comparison tables are checked when
+    the file is opened, as for any project.
+  - **If it can't write the file,** a message says so once, and it tries again at the next interval.
+  - **The setting is remembered between sessions.** Before, autosave switched itself off at every start, and opening
+    the official TagLab turned it off too.
+  - **After a crash:** open `<project>_autosave.json` with File > Open Project, then use Save As to put it back under
+    the project's own name. While the autosave file is open, autosave writes to that same file.
 
 ## DEM and surface area
 - **Surface area:**
@@ -187,6 +203,8 @@ Alignment Tool.
   - **Re-fit outline:** fits the outline of the colony to the image again (as above), e.g. after moving it.
   - Moving or re-fitting doesn't change the colony's status: press K to keep it.
   - You can also redraw it or change its class. Compare > Review Carried-over Colonies reopens the list.
+  - These keys, and the Move Region keys, can be changed or put on a mouse button (see "Keyboard and mouse
+    shortcuts").
 - **Tests on the official 2013–2014 sample:**
   - About three quarters of the surviving colonies came out `ok`.
   - 85–94% of colonies removed on purpose from the image were flagged, as were nearly all the bleached or overgrown
@@ -342,6 +360,35 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
 - **Fixes:**
   - Confirming a correction that found nothing no longer hides the region.
   - Memory no longer grows with each point during a long session.
+
+## Tool instructions
+- **In split screen, the instructions of the current tool are shown only once, on the left map.** Before, the same
+  panel covered both maps. The tool still works on both maps. With a single map nothing changes.
+
+## Keyboard and mouse shortcuts (File > Keyboard and Mouse Shortcuts...)
+- **Every TagLab key can be changed:** the menu keys (Ctrl+S, Ctrl+Z…), the region keys (A, M, D, S, Del…), the tool
+  keys 1–0, the view keys (Q, W, E, G, C, U), the carry-over review keys (N, P, K, Delete) and the Move Region keys
+  (arrows, `,` `.` `<` `>`).
+  - Click a key cell and press the new key; × removes the key.
+  - Tools that had no key (Move Region, Place point, Watershed, the two SAM tools, Edit matches) are listed too, so
+    they can get one.
+  - Space (confirm) and Esc (cancel) keep their keys, because every tool's instructions name them. Tab, Home, End,
+    [ and ] are reserved.
+- **Mouse buttons:** the middle button, the two thumb buttons (back / forward) and the right button can run an
+  action, for example Keep in the carry-over review, or Confirm (the same as Space).
+  - A plain press (without Shift, Ctrl or Alt) on either map, or in the review window, runs the action when it can be
+    used. Otherwise the button does what it did before: with the right button on Keep, a right click keeps the colony
+    while the review is open and opens the region menu otherwise.
+  - Shift + click and Shift + right click (positive / negative points) don't change.
+  - Some mice send their thumb buttons as keys: then set them in the Key column.
+- **Conflicts** are shown in red, and OK stays disabled until they are fixed. A review key may be the same as a normal
+  key, as N is by default (Next colony while the review is open, Create a Background Region otherwise): the window
+  shows a note, and the normal key is switched off while the review is open.
+- **The texts follow your keys:** the menus, the review's buttons and key line, the Move Region instructions and
+  tooltip, and Help (Ctrl+H).
+- **The defaults are the usual keys, with no mouse buttons,** so nothing changes until you edit something. Restore
+  defaults puts them back. The shortcuts are stored on each computer, not in the project, and the official TagLab
+  ignores them.
 
 ## Dictionaries
 - **`spongenursery.json`** (in the main folder, next to `FDEP.json`): the sponge nursery labels.
