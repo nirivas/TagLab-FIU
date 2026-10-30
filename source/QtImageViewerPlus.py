@@ -44,6 +44,8 @@ from source.genutils import distance_point_AABB
 
 import math
 import time
+import numpy as np
+import cv2
 from skimage import measure
 from skimage.morphology import binary_erosion
 
@@ -152,6 +154,7 @@ class QtImageViewerPlus(QtImageViewer):
 
         self.undo_data = Undo()
         self.last_nudge = None   # undo step of the last move with the arrow keys (the next ones are merged into it)
+        self.turn_centre = None  # centre of the last turn with the , and . keys (the next ones turn around it too)
 
         self.dragSelectionStart = None
         self.dragSelectionRect = None
@@ -1135,20 +1138,40 @@ class QtImageViewerPlus(QtImageViewer):
             self.selectOp(scenePos.x(), scenePos.y())
 
     NUDGE_KEYS = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0), Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
+    # degrees, clockwise on the screen; SHIFT + , and . gives < and > on most keyboards
+    TURN_KEYS = {Qt.Key_Comma: -5, Qt.Key_Period: 5, Qt.Key_Less: -90, Qt.Key_Greater: 90}
 
     def keyPressEvent(self, event):
 
         # keys handling goes here..
 
         # Move Region tool: the arrow keys move the selected regions (instead of scrolling the view)
-        if self.tools.tool == "MOVEREGION" and event.key() in self.NUDGE_KEYS and len(self.selected_blobs) > 0:
-            step = 10 if event.modifiers() & Qt.ShiftModifier else 1
-            dx, dy = self.NUDGE_KEYS[event.key()]
-            self.nudgeSelected(dx * step, dy * step)
+        if self.moveRegionKey(event.key(), event.modifiers()):
             event.accept()
             return
 
         super().keyPressEvent(event)
+
+    def moveRegionKey(self, key, modifiers):
+        """
+        The keys of the Move Region tool: the arrows move the selected regions by 1 pixel (SHIFT: 10 pixels), , and .
+        turn them by 5 degrees (SHIFT: 90 degrees). Returns whether the key was used.
+        """
+        if self.tools.tool != "MOVEREGION" or len(self.selected_blobs) == 0:
+            return False
+        shift = bool(modifiers & Qt.ShiftModifier)
+        if key in self.NUDGE_KEYS:
+            dx, dy = self.NUDGE_KEYS[key]
+            step = 10 if shift else 1
+            self.nudgeSelected(dx * step, dy * step)
+            return True
+        if key in self.TURN_KEYS:
+            angle = self.TURN_KEYS[key]
+            if shift and abs(angle) == 5:
+                angle *= 18
+            self.turnSelected(angle)
+            return True
+        return False
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Shift and self.tools.tool == "RITM":
@@ -1773,17 +1796,137 @@ class QtImageViewerPlus(QtImageViewer):
             ", ".join(str(b.id) for b in moved), dx, dy))
         return moved
 
-    def nudgeSelected(self, dx, dy):
+    def rotateBlobs(self, blobs, angle, merge=False, centre=None):
         """
-        Move the selected regions with the arrow keys: consecutive moves of the same regions are one undo step.
+        Turn the regions by angle degrees (clockwise on the screen) around centre (x, y), by default the centre of
+        their common box, as one undo step (with merge, the step is merged into the last one). Quarter turns are
+        exact; other angles resample the outline. The regions keep their ids (so their matches), class and
+        attributes; the values measured at the old place (surface area, DEM metrics) are cleared. Regions turned past
+        the map border are moved back inside (and cut if they don't fit). Returns the turned regions; the centre used
+        is left in self.turn_centre (None after moving them back inside).
         """
-        blobs = list(self.selected_blobs)
+        blobs = list(blobs)
+        if len(blobs) == 0 or self.image is None or angle % 360 == 0:
+            return []
+
+        if centre is None:
+            x0 = min(float(b.contour[:, 0].min()) for b in blobs)
+            y0 = min(float(b.contour[:, 1].min()) for b in blobs)
+            x1 = max(float(b.contour[:, 0].max()) for b in blobs)
+            y1 = max(float(b.contour[:, 1].max()) for b in blobs)
+            centre = (0.5 * (x0 + x1), 0.5 * (y0 + y1))
+        cx, cy = centre
+        quarter = angle % 90 == 0
+        if quarter:
+            cx, cy = math.floor(cx), math.floor(cy)    # pixel centres then go to pixel centres
+        R = cv2.getRotationMatrix2D((float(cx), float(cy)), -float(angle), 1.0)
+        if quarter:
+            R = np.round(R)
+
+        # each mask turned on its own canvas (pixel centres at integer coordinates)
+        turned = []
+        for blob in blobs:
+            mask = blob.getMask()
+            top, left = int(blob.bbox[0]), int(blob.bbox[1])
+            h, w = mask.shape
+            corners = np.array([[left - 0.5, top - 0.5], [left + w - 0.5, top - 0.5],
+                                [left - 0.5, top + h - 0.5], [left + w - 0.5, top + h - 0.5]])
+            moved = corners @ R[:, :2].T + R[:, 2]
+            pad = 0 if quarter else 1
+            new_left = int(math.floor(moved[:, 0].min() + 0.5)) - pad
+            new_top = int(math.floor(moved[:, 1].min() + 0.5)) - pad
+            new_w = int(math.ceil(moved[:, 0].max() - 0.5)) + pad - new_left + 1
+            new_h = int(math.ceil(moved[:, 1].max() - 0.5)) + pad - new_top + 1
+            A = R.copy()
+            A[:, 2] += R[:, :2] @ np.array([left, top], dtype=float) - np.array([new_left, new_top], dtype=float)
+            if quarter:
+                out = cv2.warpAffine(mask, A, (new_w, new_h), flags=cv2.INTER_NEAREST)
+            else:
+                out = cv2.warpAffine(mask.astype(np.float32), A, (new_w, new_h), flags=cv2.INTER_LINEAR) > 0.5
+            turned.append((blob, out.astype(np.uint8), new_left, new_top))
+
+        # back inside the map
+        W, H = int(self.image.width), int(self.image.height)
+        bounds = []
+        for blob, out, left, top in turned:
+            rows, cols = np.nonzero(out)
+            if len(rows) > 0:
+                bounds.append((left + cols.min(), top + rows.min(), left + cols.max(), top + rows.max()))
+        if len(bounds) == 0:
+            return []
+        gx0, gy0 = min(b[0] for b in bounds), min(b[1] for b in bounds)
+        gx1, gy1 = max(b[2] for b in bounds), max(b[3] for b in bounds)
+        sx = -gx0 if gx0 < 0 else (W - 1 - gx1 if gx1 > W - 1 else 0)
+        sy = -gy0 if gy0 < 0 else (H - 1 - gy1 if gy1 > H - 1 else 0)
+        self.turn_centre = (cx, cy) if sx == 0 and sy == 0 else None
+
+        result = []
+        for blob, out, left, top in turned:
+            left, top = left + sx, top + sy
+            x0c, y0c = max(0, -left), max(0, -top)
+            x1c, y1c = min(out.shape[1], W - left), min(out.shape[0], H - top)
+            if x1c <= x0c or y1c <= y0c:
+                continue
+            labels = measure.label(out[y0c:y1c, x0c:x1c] > 0, connectivity=2)
+            regions = measure.regionprops(labels)
+            if len(regions) == 0:
+                continue
+            new_blob = Blob(max(regions, key=lambda r: r.area), left + x0c, top + y0c, 0)
+            new_blob.setId(blob.id)
+            new_blob.version = blob.version + 1
+            new_blob.class_name = blob.class_name
+            new_blob.instance_name = blob.instance_name
+            new_blob.note = blob.note
+            new_blob.genet = blob.genet
+            new_blob.data = {k: v for k, v in blob.data.items() if k not in DEM_METRIC_NAMES}
+            new_blob.correspondence_to_check = blob.correspondence_to_check
+            self.updateBlob(blob, new_blob, selected=True, redraw=False)
+            result.append(new_blob)
+
+        if len(result) == 0:
+            return []
+        if merge:
+            operation = self.undo_data.operation
+            self.project.syncCorrespondences(self.image, operation['remove'], operation['add'])
+            self.undo_data.mergePendingIntoLast()
+        else:
+            self.saveUndo()
+
+        self.scene.invalidate()
+        self.logfile.info("[TOOL][MOVEREGION] Region(s) {:s} turned by {:g} degrees.".format(
+            ", ".join(str(b.id) for b in result), angle))
+        return result
+
+    def continuesLastStep(self, blobs):
+        """
+        Whether moving or turning these regions continues the last arrow / turn key step (same regions, nothing done
+        in between), so that it is merged into it.
+        """
         last = self.undo_data.peekUndo()
-        merge = last is not None and last is self.last_nudge and self.undo_data.peekRedo() is None and \
+        return last is not None and last is self.last_nudge and self.undo_data.peekRedo() is None and \
             len(self.undo_data.operation['add']) == 0 and len(self.undo_data.operation['remove']) == 0 and \
             set(id(b) for b in blobs) == set(id(b) for b in last['remove'])
-        moved = self.moveBlobs(blobs, dx, dy, merge=merge)
+
+    def nudgeSelected(self, dx, dy):
+        """
+        Move the selected regions with the arrow keys: consecutive moves and turns of the same regions are one undo
+        step.
+        """
+        blobs = list(self.selected_blobs)
+        moved = self.moveBlobs(blobs, dx, dy, merge=self.continuesLastStep(blobs))
         if len(moved) > 0:
+            self.last_nudge = self.undo_data.peekUndo()
+            self.turn_centre = None
+
+    def turnSelected(self, angle):
+        """
+        Turn the selected regions with the , and . keys: consecutive moves and turns of the same regions are one
+        undo step, and consecutive turns are made around the same centre (so turning back gives the same outline).
+        """
+        blobs = list(self.selected_blobs)
+        merge = self.continuesLastStep(blobs)
+        turned = self.rotateBlobs(blobs, angle, merge=merge, centre=self.turn_centre if merge else None)
+        if len(turned) > 0:
             self.last_nudge = self.undo_data.peekUndo()
 
     def deleteSelectedBlobs(self):

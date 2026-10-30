@@ -2,9 +2,10 @@
 # A semi-automatic segmentation tool
 #
 # Carry the regions of a map over to another map of the same plot (e.g. the next survey). Each region is placed on
-# the new map, a small residual shift is corrected, its outline is fitted to the new image with RITM, and a few
-# measures tell whether the colony is still there. Doubtful colonies are flagged ("check", "possibly gone") so that
-# the user can review them; nothing is decided silently.
+# the new map, looked for nearby if it moved or turned (e.g. a nursery brick that was re-laid), a small residual
+# shift is corrected, its outline is fitted to the new image (RITM and GrabCut), and a few measures tell whether the
+# colony is still there. Doubtful colonies are flagged ("check", "possibly gone") so that the user can review them;
+# nothing is decided silently.
 #
 # The functions work on numpy arrays and QImages only (no widgets), so they can run in a worker thread and be tested
 # without the TagLab window.
@@ -51,9 +52,33 @@ LOCAL_MAX_SIDE = 512            # patches are reduced to this size for the local
 MIN_COVERED = 0.5               # minimum fraction of the outline covered by valid pixels of the new map
 EXISTING_OVERLAP = 0.5          # overlap (fraction of the smaller region) of a region already on the new map
 
+# --- moved or turned colonies (e.g. nursery bricks re-laid between the surveys) ---
+# The old map around the colony (a disc holding the colony and what it sits on) is looked for on the new map at every
+# rotation and at shifts up to the search distance, matching the colour and, with a DEM on both maps, the height
+# above the ground. Tuned on a sponge nursery (Nursery1, May -> Aug 2026: almost every brick turned, some moved
+# ~10 cm) and on the official 2013-2014 reef sample (colonies do not move).
+DEFAULT_SEARCH_MM = 150.0       # default search distance
+RELOCATE_PIXEL_MM = 2.8         # the search works at about this pixel size (never finer than the map)
+RELOCATE_BLUR = 1.0             # Gaussian blur (search pixels) applied before matching
+RELOCATE_MIN_RADIUS_MM = 80.0   # radius of the disc matched: at least this..
+RELOCATE_SIZE_FACTOR = 0.9      # ..and 0.9 x the longest side of the colony
+RELOCATE_COARSE_STEP = 5        # degrees between the rotations tried, then..
+RELOCATE_FINE_STEP = 1          # ..every degree around the best one
+RELOCATE_RELIEF_MM = (-30.0, 150.0)   # height above the ground (mm) clipped to this range before matching
+RELOCATE_MARGIN = 0.1           # a move is used only if it matches better than the colony left in place by this..
+RELOCATE_MIN_SCORE = 0.3        # ..and matches at least this well (normalised cross-correlation, -1..1)
+RELOCATE_FAR_MM = 50.0          # moves farther than this must match better..
+RELOCATE_FAR_MARGIN = 0.02      # ..by this per cm beyond it (on a reef, the far matches were similar neighbours)
+
 RITM_INPUT_SIDE = 400           # longest side of the RITM input (the size RITM works at after the first click)
 RITM_EXPANSION = 1.4            # RITM crop = the colony box enlarged 1.4 times..
 RITM_MIN_CROP = 200             # ..and at least 200 pixels
+GRABCUT_EXPANSION = 2.0         # GrabCut crop = the colony box enlarged 2 times (room for the background colours)
+GRABCUT_RING = 0.4              # GrabCut: the colony may grow by this fraction of its radius
+GRABCUT_ITERATIONS = 5
+GRABCUT_MAX_SIDE = 600          # larger GrabCut crops are reduced to this size
+REFIT_AGREEMENT = 0.6           # the old outline kept by the re-fit counts as fitted if it agrees this well (IoU)
+REFIT_MAX_GROWTH = 2.0          # re-fit candidates more than 2 times larger than the old outline are left out
 MIN_REFIT_IOU = 0.3             # a re-fitted outline overlapping the old one less than this is not used
 REFIT_AREA_RANGE = (0.3, 3.0)   # nor one whose area changed more than this
 
@@ -213,7 +238,8 @@ class CarriedColony(object):
         self.score = None         # 0-1
         self.covered = True       # False: outside the new map or over its empty (nodata) area
         self.existing_id = None   # id of a region already on the new map that is the same colony
-        self.refit = False        # True if the outline was fitted to the new map with RITM
+        self.refit = False        # True if the outline was fitted to the new map (RITM / GrabCut)
+        self.relocation = None    # Relocation: the colony was found moved or turned
         self.shift = (0.0, 0.0)   # residual shift corrected (target pixels)
         self.signals = {}
         self.reasons = []
@@ -429,7 +455,8 @@ def decideStatus(signals, px_size, refit_tried, refit_ok):
 
     area_ratio = signals.get("area_ratio")
     if refit_ok and area_ratio is not None and not (AREA_CHECK_RANGE[0] <= area_ratio <= AREA_CHECK_RANGE[1]):
-        reasons.append("area changed a lot")
+        reasons.append("{} ({:+.0f}% area)".format("smaller" if area_ratio < 1.0 else "larger",
+                                                   100.0 * (area_ratio - 1.0)))
         if status == STATUS_OK:
             status = STATUS_CHECK
 
@@ -462,6 +489,8 @@ class RitmRefit(object):
         self.predictor = None
         self.device = None
         self.network = None
+        self.choice = None          # outline kept by the last refit (see refit)
+        self.agreement = None
 
     def load(self):
 
@@ -484,58 +513,176 @@ class RitmRefit(object):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def refit(self, img, mask, use_prev_mask=True):
+    def predict(self, small, clicks):
         """
-        The outline (mask) fitted to the image with RITM: the old outline is the starting mask, with one positive
-        click at its most interior point (use_prev_mask=False: the click only). It returns the new mask (same size;
-        empty if RITM finds nothing), or None if the colony is too small to try.
+        RITM on the prepared image small (see refit) with the clicks [(row, column, positive)], from an empty starting
+        mask. It returns the probability map (same size as small).
         """
         from models.isegm.inference.clicker import Clicker, Click
+
+        clicker = Clicker()
+        for row, col, positive in clicks:
+            clicker.add_click(Click(is_positive=positive, coords=(int(row), int(col))))
+        prev_mask = torch.zeros((1, 1) + small.shape[:2], dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            return self.predictor.get_prediction(clicker, prev_mask=prev_mask)
+
+    def refit(self, img, mask):
+        """
+        The outline (mask) fitted to the image. Three candidate outlines are made around it:
+         - RITM with one click at its most interior point, and RITM with two clicks (the two most interior points far
+           apart), both without a starting outline: started from the old outline, RITM gives it back unchanged, so
+           it could neither shrink nor grow;
+         - GrabCut started from the outline (colour: inside = probably colony, a ring around it = probably not).
+        Candidates more than REFIT_MAX_GROWTH times larger than the old outline are left out (on a sponge nursery they
+        were mostly the whole brick the sponge sits on), then the one agreeing best with the others and with the old
+        outline (sum of the IoUs) is returned; it may be the old outline itself. On the hand-made outlines of a sponge
+        nursery made 30% too big, or turned by 20 degrees and shifted, this choice came back to them with a median IoU
+        of 0.82 and 0.86 (0.57 and 0.64 before), closer than any of the candidates alone; an outline can at most
+        double its area.
+        It returns the new mask (same size), or None if the colony is too small to try. self.choice tells which
+        outline was kept ("ritm 1 click", "ritm 2 clicks", "grabcut" or "old outline") and self.agreement how well it
+        agrees with the others (mean IoU).
+        """
+        self.choice = None
+        self.agreement = None
 
         rows, cols = np.nonzero(mask)
         if len(rows) == 0:
             return None
-        y0, y1 = rows.min(), rows.max() + 1
-        x0, x1 = cols.min(), cols.max() + 1
-        cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
-        ew = max(RITM_MIN_CROP, RITM_EXPANSION * (x1 - x0))
-        eh = max(RITM_MIN_CROP, RITM_EXPANSION * (y1 - y0))
-        H, W = mask.shape
-        qx0 = max(0, int(math.floor(cx - ew / 2)))
-        qy0 = max(0, int(math.floor(cy - eh / 2)))
-        qx1 = min(W, int(math.ceil(cx + ew / 2)))
-        qy1 = min(H, int(math.ceil(cy + eh / 2)))
+        qy0, qx0, qy1, qx1 = cropAround(mask.shape, cols.min(), rows.min(), cols.max() + 1, rows.max() + 1,
+                                        RITM_EXPANSION)
         qw, qh = qx1 - qx0, qy1 - qy0
 
         crop = img[qy0:qy1, qx0:qx1]
-        mcrop = mask[qy0:qy1, qx0:qx1].astype(np.float32)
+        mcrop = mask[qy0:qy1, qx0:qx1]
 
         f = RITM_INPUT_SIDE / max(qw, qh)
         size = (max(1, int(round(qw * f))), max(1, int(round(qh * f))))
         small = cv2.resize(crop, size, interpolation=cv2.INTER_AREA if f < 1.0 else cv2.INTER_LINEAR)
-        msmall = cv2.resize(mcrop, size, interpolation=cv2.INTER_LINEAR)
+        msmall = cv2.resize(mcrop.astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
         binary = (msmall > 0.5).astype(np.uint8)
         if binary.sum() == 0:
             return None
 
-        dist = cv2.distanceTransform(np.pad(binary, 1), cv2.DIST_L2, 5)[1:-1, 1:-1]
-        py, px = np.unravel_index(int(np.argmax(dist)), dist.shape)
+        clicks = [(r, c, True) for r, c in interiorPoints(binary, 2)]
 
         self.load()
-        clicker = Clicker()
-        clicker.add_click(Click(is_positive=True, coords=(int(py), int(px))))
-        start = binary.astype(np.float32) if use_prev_mask else np.zeros(binary.shape, dtype=np.float32)
-        prev_mask = torch.from_numpy(start).unsqueeze(0).unsqueeze(0).to(self.device)
         with torch.no_grad():
             self.predictor.set_input_image(np.ascontiguousarray(small))
-            pred = self.predictor.get_prediction(clicker, prev_mask=prev_mask)
 
-        prob = cv2.resize(pred.astype(np.float32), (qw, qh), interpolation=cv2.INTER_LINEAR)
-        seg = largestComponent((prob > 0.5).astype(np.uint8), reference=mask[qy0:qy1, qx0:qx1])
+        placed = (mask > 0).astype(np.uint8)
+        candidates = []
+        for name, n in (("ritm 1 click", 1), ("ritm 2 clicks", 2)):
+            if len(clicks) < n:
+                continue
+            prob = cv2.resize(self.predict(small, clicks[:n]).astype(np.float32), (qw, qh),
+                              interpolation=cv2.INTER_LINEAR)
+            out = np.zeros_like(mask, dtype=np.uint8)
+            out[qy0:qy1, qx0:qx1] = largestComponent((prob > 0.5).astype(np.uint8), reference=mcrop)
+            candidates.append((name, out))
+        candidates.append(("grabcut", grabCutRefit(img, mask)))
 
-        out = np.zeros_like(mask, dtype=np.uint8)
-        out[qy0:qy1, qx0:qx1] = seg
+        limit = REFIT_MAX_GROWTH * np.count_nonzero(placed)
+        candidates = [("old outline", placed)] + [(name, m) for name, m in candidates
+                                                  if 0 < np.count_nonzero(m) <= limit]
+        self.choice, chosen, self.agreement = consensus(candidates)
+        return chosen
+
+
+def cropAround(shape, x0, y0, x1, y1, expansion):
+    """
+    The crop (top, left, bottom, right) of an image of the given shape around the box [x0, x1) x [y0, y1), enlarged
+    by expansion and at least RITM_MIN_CROP pixels wide and high, clipped to the image.
+    """
+    cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+    ew = max(RITM_MIN_CROP, expansion * (x1 - x0))
+    eh = max(RITM_MIN_CROP, expansion * (y1 - y0))
+    H, W = shape[:2]
+    return (max(0, int(math.floor(cy - eh / 2))), max(0, int(math.floor(cx - ew / 2))),
+            min(H, int(math.ceil(cy + eh / 2))), min(W, int(math.ceil(cx + ew / 2))))
+
+
+def interiorPoints(mask, n):
+    """
+    Up to n points (row, column) well inside the mask: the most interior one, then the most interior one outside
+    discs around the previous ones (1.2 x their distance to the border).
+    """
+    dist = cv2.distanceTransform(np.pad(mask.astype(np.uint8), 1), cv2.DIST_L2, 5)[1:-1, 1:-1]
+    left = dist.copy()
+    rows, cols = np.ogrid[:dist.shape[0], :dist.shape[1]]
+    points = []
+    for i in range(n):
+        r, c = np.unravel_index(int(np.argmax(left)), left.shape)
+        if dist[r, c] < 2.0:
+            break
+        points.append((int(r), int(c)))
+        left[(rows - r) ** 2 + (cols - c) ** 2 <= (1.2 * dist[r, c]) ** 2] = 0
+    return points
+
+
+def grabCutRefit(img, mask):
+    """
+    The outline (mask) fitted to the colours of the image with GrabCut: inside the outline = probably colony, a ring
+    around it (GRABCUT_RING of its radius) = probably not, farther = not. It returns the new mask (same size; empty if
+    GrabCut fails).
+    """
+    out = np.zeros_like(mask, dtype=np.uint8)
+    rows, cols = np.nonzero(mask)
+    if len(rows) == 0:
         return out
+    qy0, qx0, qy1, qx1 = cropAround(mask.shape, cols.min(), rows.min(), cols.max() + 1, rows.max() + 1,
+                                    GRABCUT_EXPANSION)
+    crop = img[qy0:qy1, qx0:qx1]
+    start = (mask[qy0:qy1, qx0:qx1] > 0).astype(np.uint8)
+
+    f = min(1.0, GRABCUT_MAX_SIDE / max(crop.shape[:2]))
+    if f < 1.0:
+        size = (max(1, int(round(crop.shape[1] * f))), max(1, int(round(crop.shape[0] * f))))
+        crop = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+        start = cv2.resize(start, size, interpolation=cv2.INTER_NEAREST)
+    if start.sum() == 0:
+        return out
+
+    radius = math.sqrt(start.sum() / math.pi)
+    outer = cv2.dilate(start, disk(max(3.0, GRABCUT_RING * radius)))
+    labels = np.full(start.shape, cv2.GC_BGD, dtype=np.uint8)
+    labels[outer > 0] = cv2.GC_PR_BGD
+    labels[start > 0] = cv2.GC_PR_FGD
+    bgd = np.zeros((1, 65), dtype=np.float64)
+    fgd = np.zeros((1, 65), dtype=np.float64)
+    try:
+        cv2.grabCut(cv2.cvtColor(np.ascontiguousarray(crop), cv2.COLOR_RGB2BGR), labels, None, bgd, fgd,
+                    GRABCUT_ITERATIONS, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return out
+    seg = largestComponent(((labels == cv2.GC_FGD) | (labels == cv2.GC_PR_FGD)).astype(np.uint8), reference=start)
+
+    if f < 1.0:
+        seg = cv2.resize(seg, (qx1 - qx0, qy1 - qy0), interpolation=cv2.INTER_NEAREST)
+    out[qy0:qy1, qx0:qx1] = seg
+    return out
+
+
+def maskIoU(a, b):
+    union = int(np.count_nonzero(a | b))
+    return int(np.count_nonzero(a & b)) / union if union > 0 else 0.0
+
+
+def consensus(candidates):
+    """
+    Of the candidate outlines [(name, mask)], the one agreeing best with the others (largest sum of IoUs); empty
+    masks are left out. It returns (name, mask, mean IoU with the others).
+    """
+    candidates = [(name, m) for name, m in candidates if m is not None and m.any()]
+    if len(candidates) == 1:
+        return candidates[0][0], candidates[0][1], None
+    best = None
+    for i, (name, m) in enumerate(candidates):
+        total = sum(maskIoU(m, other) for j, (_, other) in enumerate(candidates) if j != i)
+        if best is None or total > best[2]:
+            best = (name, m, total)
+    return best[0], best[1], best[2] / (len(candidates) - 1)
 
 
 def acceptRefit(mask, refitted):
@@ -554,13 +701,14 @@ def acceptRefit(mask, refitted):
 
 def refitBox(blob, width, height):
     """
-    The box [top, left, w, h] of the map around a region with room for the RITM crop (see RitmRefit.refit), clipped
-    to the map.
+    The box [top, left, w, h] of the map around a region with room for the re-fit crops (see RitmRefit.refit),
+    clipped to the map.
     """
     top, left, w, h = [float(v) for v in blob.bbox]
     cx, cy = left + w / 2.0, top + h / 2.0
-    ew = max(RITM_MIN_CROP, RITM_EXPANSION * w) / 2.0 + 4
-    eh = max(RITM_MIN_CROP, RITM_EXPANSION * h) / 2.0 + 4
+    expansion = max(RITM_EXPANSION, GRABCUT_EXPANSION)
+    ew = max(RITM_MIN_CROP, expansion * w) / 2.0 + 4
+    eh = max(RITM_MIN_CROP, expansion * h) / 2.0 + 4
     x0 = max(0, int(math.floor(cx - ew)))
     y0 = max(0, int(math.floor(cy - eh)))
     x1 = min(int(width), int(math.ceil(cx + ew)))
@@ -571,7 +719,7 @@ def refitBox(blob, width, height):
 class CarryOverContext(object):
 
     def __init__(self, src_image, dst_image, src_qimage, dst_qimage, placement, taglab_dir, refit=True,
-                 use_dem=False, existing_blobs=None):
+                 use_dem=False, existing_blobs=None, search_mm=0.0):
 
         self.src_image = src_image
         self.dst_image = dst_image
@@ -580,6 +728,8 @@ class CarryOverContext(object):
         self.placement = placement
         self.taglab_dir = taglab_dir
         self.refit = refit
+        self.use_dem = use_dem            # the height change counts in the "still there?" score
+        self.search_mm = search_mm        # > 0: look for colonies that moved or turned, up to this distance
 
         self.px_src = src_image.pixelSize()
         self.px_dst = dst_image.pixelSize()
@@ -589,9 +739,10 @@ class CarryOverContext(object):
 
         self.ritm = RitmRefit(taglab_dir)
 
+        # the DEMs are read for the height change and to find moved colonies
         self.src_dem = None
         self.dst_dem = None
-        if use_dem and src_image.hasDEM() and dst_image.hasDEM():
+        if (use_dem or search_mm > 0) and src_image.hasDEM() and dst_image.hasDEM():
             self.src_dem = DemReader(os.path.join(taglab_dir, src_image.getDEMChannel().filename), self.px_src)
             self.dst_dem = DemReader(os.path.join(taglab_dir, dst_image.getDEMChannel().filename), self.px_dst)
 
@@ -622,30 +773,57 @@ class CarryOverContext(object):
     def loadRitm(self):
         self.ritm.load()
 
-    def refitWithRitm(self, img, mask, use_prev_mask=True):
-        return self.ritm.refit(img, mask, use_prev_mask)
+    def refitWithRitm(self, img, mask):
+        return self.ritm.refit(img, mask)
 
     def cropTarget(self, box):
         return qimageToNumpyArray(cropQImage(self.dst_qimage, box))
 
-    def cropSourceOnTarget(self, box):
+    def cropSourceOnTarget(self, box, M=None):
         """
-        The source map resampled on the target grid, in the box [top, left, w, h] of the target map.
+        The source map resampled on the target grid, in the box [top, left, w, h] of the target map. M (source pixel
+        -> target pixel) is the placement of the maps unless given (e.g. with the move of a colony).
+        """
+        M = self.placement.M if M is None else M
+        top, left, w, h = box
+        sl, st, sw, sh = self.sourceWindow(box, M)
+        src = qimageToNumpyArray(cropQImage(self.src_qimage, [st, sl, sw, sh]))
+        return cv2.warpAffine(src, self.cropMatrix(M, sl, st, left, top), (w, h), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    def sourceReliefOnTarget(self, box, M=None):
+        """
+        Height (mm) above the ground of the source DEM resampled on the target grid, in the box [top, left, w, h] of
+        the target map (see relief); 0 where there is no DEM.
+        """
+        M = self.placement.M if M is None else M
+        top, left, w, h = box
+        sl, st, sw, sh = self.sourceWindow(box, M)
+        z = relief(self.src_dem.readWindow(st, sl, sh, sw))
+        return cv2.warpAffine(z, self.cropMatrix(M, sl, st, left, top), (w, h), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    def sourceWindow(self, box, M):
+        """
+        The window (left, top, w, h) of the source map covering the box [top, left, w, h] of the target map.
         """
         top, left, w, h = box
         corners = np.array([[left, top], [left + w, top], [left, top + h], [left + w, top + h]], dtype=np.float64)
-        src_corners = applyMatrix(invertMatrix(self.placement.M), corners)
+        src_corners = applyMatrix(invertMatrix(M), corners)
         sl = int(math.floor(src_corners[:, 0].min())) - 2
         st = int(math.floor(src_corners[:, 1].min())) - 2
         sw = int(math.ceil(src_corners[:, 0].max())) + 2 - sl
         sh = int(math.ceil(src_corners[:, 1].max())) + 2 - st
+        return sl, st, sw, sh
 
-        src = qimageToNumpyArray(cropQImage(self.src_qimage, [st, sl, sw, sh]))
-
-        # crop pixel -> box pixel
-        A = self.placement.M.copy()
+    @staticmethod
+    def cropMatrix(M, sl, st, left, top):
+        """
+        M between the source window starting at (sl, st) and the target box starting at (left, top).
+        """
+        A = np.array(M, dtype=np.float64).copy()
         A[:, 2] = A[:, :2] @ np.array([sl, st], dtype=np.float64) + A[:, 2] - np.array([left, top], dtype=np.float64)
-        return cv2.warpAffine(src, A, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return A
 
     def findExisting(self, class_name, mask, box):
         """
@@ -669,7 +847,7 @@ class CarryOverContext(object):
         Height (above the surrounding plane) of the colony in year 1 (its outline on the source DEM) and in year 2
         (the same outline on the target DEM).
         """
-        if self.src_dem is None or self.dst_dem is None:
+        if not self.use_dem or self.src_dem is None or self.dst_dem is None:
             return {}
 
         pad = 3 + max(2, int(0.15 * math.sqrt(max(1.0, blob.area))))
@@ -692,6 +870,179 @@ class CarryOverContext(object):
         return signals
 
 
+#### MOVED OR TURNED COLONIES
+
+class Relocation(object):
+    """
+    A colony found moved or turned on the new map: L (2x3, target pixel -> target pixel) moves its placed outline.
+    """
+
+    def __init__(self, L, angle, shift, score, in_place):
+        self.L = L
+        self.angle = angle          # degrees, clockwise on the screen
+        self.shift = shift          # (dx, dy) of the colony centre, target pixels
+        self.score = score          # match at the new place (normalised cross-correlation, less the distance cost)
+        self.in_place = in_place    # match with the colony left in place
+
+    def signedAngle(self):
+        return ((self.angle + 180.0) % 360.0) - 180.0
+
+    def description(self, px_size):
+        """
+        E.g. "moved 6 cm, turned 90° clockwise" (px_size: mm per target pixel).
+        """
+        parts = []
+        dist_cm = math.hypot(*self.shift) * px_size / 10.0
+        if dist_cm >= 0.5:
+            parts.append("moved {:.0f} cm".format(dist_cm))
+        a = self.signedAngle()
+        if abs(a) >= 1.0:
+            parts.append("turned {:.0f}° {}".format(abs(a), "clockwise" if a > 0 else "anticlockwise"))
+        return ", ".join(parts) if parts else "moved"
+
+
+def relief(z):
+    """
+    Height (mm) of the DEM window z (m) above the plane fitted to its valid values, clipped to RELOCATE_RELIEF_MM;
+    0 where z is not valid (float32).
+    """
+    out = np.zeros(z.shape, dtype=np.float32)
+    valid = np.isfinite(z)
+    sub = valid[::4, ::4]
+    if sub.sum() < 3:
+        return out
+    rows, cols = np.nonzero(sub)
+    A = np.column_stack((4 * cols, 4 * rows, np.ones(len(rows))))
+    coeffs = np.linalg.lstsq(A, z[::4, ::4][sub], rcond=None)[0]
+    rows, cols = np.nonzero(valid)
+    base = coeffs[0] * cols + coeffs[1] * rows + coeffs[2]
+    out[valid] = np.clip((z[valid] - base) * 1000.0, *RELOCATE_RELIEF_MM)
+    return out
+
+
+def subpixelPeak(res, row, col):
+    """
+    Position of the maximum of res near (row, col), refined with a parabola along each axis.
+    """
+    def offset(a, b, c):
+        den = a - 2.0 * b + c
+        return 0.0 if abs(den) < 1e-12 else float(np.clip(0.5 * (a - c) / den, -0.5, 0.5))
+
+    r, c = float(row), float(col)
+    if 0 < row < res.shape[0] - 1:
+        r += offset(res[row - 1, col], res[row, col], res[row + 1, col])
+    if 0 < col < res.shape[1] - 1:
+        c += offset(res[row, col - 1], res[row, col], res[row, col + 1])
+    return r, c
+
+
+def relocateColony(ctx, blob):
+    """
+    Look for the colony around its place on the new map, turned by any angle and moved by up to ctx.search_mm. The
+    old map around it (a disc holding the colony and what it sits on, resampled on the new map) is matched with the
+    new map at about RELOCATE_PIXEL_MM per pixel: normalised cross-correlation of the grey levels and, with a DEM on
+    both maps, of the height above the ground (mean of the two), every RELOCATE_COARSE_STEP degrees and then every
+    RELOCATE_FINE_STEP degrees around the best angle. It returns a Relocation if the colony matches clearly better
+    elsewhere than in place (RELOCATE_MARGIN, RELOCATE_MIN_SCORE), otherwise None. Matches farther than
+    RELOCATE_FAR_MM count less (RELOCATE_FAR_MARGIN), and nothing beyond ctx.search_mm is looked at.
+    """
+    M = ctx.placement.M
+    top, left, w, h = [float(v) for v in blob.bbox]
+    centre = applyMatrix(M, np.array([[left + 0.5 * (w - 1.0), top + 0.5 * (h - 1.0)]]))[0]
+    scale = math.sqrt(abs(float(np.linalg.det(np.asarray(M, dtype=np.float64)[:, :2]))))
+    R = int(math.ceil(max(RELOCATE_MIN_RADIUS_MM / ctx.px_dst, RELOCATE_SIZE_FACTOR * max(w, h) * scale)))
+    S = int(math.ceil(ctx.search_mm / ctx.px_dst))
+    cx, cy = int(round(centre[0])), int(round(centre[1]))
+    tbox = [cy - R, cx - R, 2 * R + 1, 2 * R + 1]
+    sbox = [cy - R - S, cx - R - S, 2 * (R + S) + 1, 2 * (R + S) + 1]
+
+    src_rgb = ctx.cropSourceOnTarget(tbox)
+    tgt_rgb = ctx.cropTarget(sbox)
+    tvalid = src_rgb.any(axis=2)
+    svalid = tgt_rgb.any(axis=2)
+    if tvalid.mean() < 0.5 or svalid.mean() < 0.25:
+        return None
+
+    templates = [toGray(src_rgb)]
+    searches = [toGray(tgt_rgb)]
+    if ctx.src_dem is not None and ctx.dst_dem is not None:
+        templates.append(ctx.sourceReliefOnTarget(tbox))
+        searches.append(relief(ctx.dst_dem.readWindow(sbox[0], sbox[1], sbox[3], sbox[2])))
+
+    g = min(1.0, ctx.px_dst / RELOCATE_PIXEL_MM)
+
+    def prepare(img, valid):
+        img = img.astype(np.float32)
+        img[~valid] = float(img[valid].mean())
+        if g < 1.0:
+            img = cv2.resize(img, None, fx=g, fy=g, interpolation=cv2.INTER_AREA)
+        return cv2.GaussianBlur(img, (0, 0), RELOCATE_BLUR)
+
+    templates = [prepare(t, tvalid) for t in templates]
+    searches = [prepare(s, svalid) for s in searches]
+    th, tw = templates[0].shape
+    rows, cols = np.mgrid[0:th, 0:tw]
+    tc = ((tw - 1) / 2.0, (th - 1) / 2.0)
+    disc = (cols - tc[0]) ** 2 + (rows - tc[1]) ** 2 <= (0.5 * min(tw, th) - 1.0) ** 2
+    tval = cv2.resize(tvalid.astype(np.uint8), (tw, th), interpolation=cv2.INTER_NEAREST) > 0
+    base_mask = (disc & tval).astype(np.uint8)
+
+    def scoreMap(angle):
+        rot = cv2.getRotationMatrix2D(tc, -angle, 1.0)
+        mask = cv2.warpAffine(base_mask, rot, (tw, th), flags=cv2.INTER_NEAREST)
+        if mask.sum() < 0.25 * disc.sum():
+            return None
+        total = None
+        for t, s in zip(templates, searches):
+            turned = cv2.warpAffine(t, rot, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            res = cv2.matchTemplate(s, turned, cv2.TM_CCOEFF_NORMED, mask=mask)
+            res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            total = res if total is None else total + res
+        total /= len(templates)
+        total -= penalty
+        total[far] = -1.0
+        return total
+
+    rh, rw = searches[0].shape[0] - th + 1, searches[0].shape[1] - tw + 1
+    rr, cc = np.ogrid[:rh, :rw]
+    dist_mm = np.sqrt((rr - (rh - 1) / 2.0) ** 2 + (cc - (rw - 1) / 2.0) ** 2) * ctx.px_dst / g
+    far = dist_mm > ctx.search_mm
+    penalty = (RELOCATE_FAR_MARGIN / 10.0) * np.maximum(0.0, dist_mm - RELOCATE_FAR_MM).astype(np.float32)
+    best = None
+    in_place = None
+
+    def tryAngle(angle):
+        nonlocal best, in_place
+        res = scoreMap(angle)
+        if res is None:
+            return
+        if angle == 0:
+            in_place = float(res[dist_mm <= ctx.px_dst / g].max())
+        row, col = np.unravel_index(int(np.argmax(res)), res.shape)
+        if best is None or res[row, col] > best[0]:
+            best = (float(res[row, col]), angle, res, int(row), int(col))
+
+    for angle in range(0, 360, RELOCATE_COARSE_STEP):
+        tryAngle(angle)
+    if best is None or in_place is None:
+        return None
+    coarse = best[1]
+    for k in range(-RELOCATE_COARSE_STEP + 1, RELOCATE_COARSE_STEP):
+        if k != 0 and k % RELOCATE_FINE_STEP == 0:
+            tryAngle((coarse + k) % 360)
+
+    score, angle, res, row, col = best
+    if score < RELOCATE_MIN_SCORE or score < in_place + RELOCATE_MARGIN:
+        return None
+
+    r, c = subpixelPeak(res, row, col)
+    dx = (c - (res.shape[1] - 1) / 2.0) / g
+    dy = (r - (res.shape[0] - 1) / 2.0) / g
+    L = cv2.getRotationMatrix2D((float(cx), float(cy)), -float(angle), 1.0)
+    L[:, 2] += (dx, dy)
+    return Relocation(L, float(angle), (dx, dy), score, in_place)
+
+
 class ColonyWindow(object):
     """
     The neighbourhood of a colony on the target map: box [top, left, w, h] of the target map, the target crop, the
@@ -707,12 +1058,13 @@ class ColonyWindow(object):
         self.mask = mask
 
 
-def colonyWindow(ctx, blob, result):
+def colonyWindow(ctx, blob, result, M=None):
     """
-    Place the colony on the target map and correct the residual shift around it. It returns a ColonyWindow, or None
-    if the colony is not carried over (result.covered / result.existing_id say why).
+    Place the colony on the target map (with M, source pixel -> target pixel; by default the placement of the maps)
+    and correct the residual shift around it. It returns a ColonyWindow, or None if the colony is not carried over
+    (result.covered / result.existing_id say why).
     """
-    M = ctx.placement.M
+    M = ctx.placement.M if M is None else M
     contour = applyMatrix(M, blob.contour)
     inner = [applyMatrix(M, c) for c in blob.inner_contours]
 
@@ -745,7 +1097,7 @@ def colonyWindow(ctx, blob, result):
         result.existing_id = existing_id
         return None
 
-    src = ctx.cropSourceOnTarget(box)
+    src = ctx.cropSourceOnTarget(box, M)
 
     # residual shift around the colony
     g = min(1.0, LOCAL_MAX_SIDE / max(box[2], box[3]))
@@ -768,7 +1120,16 @@ def colonyWindow(ctx, blob, result):
 def processColony(ctx, blob):
 
     result = CarriedColony(blob)
-    window = colonyWindow(ctx, blob, result)
+
+    M = None
+    if ctx.search_mm > 0:
+        result.relocation = relocateColony(ctx, blob)
+        if result.relocation is not None:
+            M = composeMatrix(result.relocation.L, ctx.placement.M)
+            result.signals["move_mm"] = math.hypot(*result.relocation.shift) * ctx.px_dst
+            result.signals["turn_deg"] = result.relocation.signedAngle()
+
+    window = colonyWindow(ctx, blob, result, M)
     if window is None:
         return result
 
@@ -781,16 +1142,22 @@ def processColony(ctx, blob):
         refitted = ctx.refitWithRitm(tgt, mask)
         if refitted is not None:
             accepted, iou, ratio = acceptRefit(mask, refitted)
+            choice = getattr(ctx.ritm, "choice", None)
+            agreement = getattr(ctx.ritm, "agreement", None)
             result.signals["refit_iou"] = iou
             result.signals["area_ratio"] = ratio
+            result.signals["refit_choice"] = choice
             if accepted:
                 new_mask = refitted
-                refit_ok = True
+                # the old outline kept because the re-fits disagree with each other is not a fitted outline
+                refit_ok = choice != "old outline" or (agreement is not None and agreement >= REFIT_AGREEMENT)
     result.refit = refit_ok
 
     result.signals.update(presenceSignals(src, tgt, mask, ctx.px_dst))
     result.signals.update(ctx.demSignals(blob, mask, box))
     result.score, result.status, result.reasons = decideStatus(result.signals, ctx.px_dst, ctx.refit, refit_ok)
+    if result.relocation is not None:
+        result.reasons.insert(0, result.relocation.description(ctx.px_dst))
 
     new_blob = blobFromMask(new_mask, left, top)
     if new_blob is None:

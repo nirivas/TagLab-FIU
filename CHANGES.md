@@ -149,13 +149,24 @@ under the same GPL-3 licence. It changes the following.
 ## Carry Regions Over (Compare > Carry Regions Over…)
 Annotates a new timepoint from the previous one. The two maps must already be aligned, for example with the
 Alignment Tool.
-- **What it does:** each colony of the annotated map is placed at the same position on the new map. Its outline is
-  fitted to the new image with RITM, and TagLab checks whether the colony is still there by comparing structure,
-  colour, brightness, texture and, when both maps have a DEM, height.
-- **Choices in the window:** the two maps, the classes to copy, outline fitting on or off, and the elevation change
-  (only when both maps have a DEM).
+- **What it does:** each colony of the annotated map is placed at the same position on the new map or, if it was
+  moved or turned (for example a nursery brick laid again), where it is found nearby. Its outline is fitted to the
+  new image, and TagLab checks whether the colony is still there by comparing structure, colour, brightness, texture
+  and, when both maps have a DEM, height.
+- **Choices in the window:** the two maps, the classes to copy, the search for moved or turned colonies (on, up to
+  15 cm, by default), outline fitting on or off, and the elevation change (only when both maps have a DEM).
 - **How the maps are lined up:** same pixel grid, through the georeferencing, or a small offset found from the
   images. A small local shift (up to 5 cm) is also corrected around each colony.
+- **Moved or turned colonies:** TagLab looks for each colony around its old place, turned by any angle and moved up
+  to the search distance. It matches the old map around the colony (the colony and what it sits on, e.g. its
+  brick) with the new map, and the elevation too when both maps have a DEM. A colony is moved only if it matches
+  clearly better there than in place, and farther moves need a better match. The review's "Why" column says, e.g.,
+  "moved 6 cm, turned 90° clockwise".
+- **Outline fitting:** RITM (with one and with two clicks inside the colony) and GrabCut (colour) each propose an
+  outline, and the one that agrees best with the others and with the old outline is kept. The outline can now
+  shrink or grow (at most doubling its area): before, RITM was started from the old outline and gave it back almost
+  unchanged. When the proposals disagree, the old outline is kept and the colony is marked `check` ("outline not
+  re-fitted"). "Smaller" / "larger" reasons give the change, e.g. "smaller (-35% area)".
 - **Result on the new map:**
   - Each colony keeps its class, name and custom attributes. DEM metrics are not copied.
   - Three new region attributes, exported in the CSV and shapefile:
@@ -170,8 +181,9 @@ Alignment Tool.
   - **N / P:** next or previous colony.
   - **K:** keep it.
   - **Delete:** remove it; it becomes "dead" in the comparison table.
-  - **Move (drag / arrows):** selects the colony and switches to the Move Region tool, to drag it onto the right spot.
-  - **Re-fit outline:** fits the outline of the colony to the image again (RITM), e.g. after moving it.
+  - **Move (drag / arrows):** selects the colony and switches to the Move Region tool, to drag it onto the right spot
+    (`,` and `.` turn it).
+  - **Re-fit outline:** fits the outline of the colony to the image again (as above), e.g. after moving it.
   - Moving or re-fitting doesn't change the colony's status: press K to keep it.
   - You can also redraw it or change its class. Compare > Review Carried-over Colonies reopens the list.
 - **Tests on the official 2013–2014 sample:**
@@ -179,7 +191,17 @@ Alignment Tool.
   - 85–94% of colonies removed on purpose from the image were flagged, as were nearly all the bleached or overgrown
     ones.
   - Colonies flattened in the DEM came out `possibly gone`.
-- **Speed:** about 0.4 s per colony on a laptop CPU, much less on an NVIDIA GPU.
+  - With the new outline fitting, the carried outlines match the hand-made 2014 ones much better: median overlap
+    (IoU) 0.81, against 0.61 with the old fitting. The search for moved colonies leaves 50 of the 53 reef colonies
+    where they are and moves the other 3 by 2 cm or less.
+- **Tests on Nursery1 (May → August 2026), where almost every brick was turned and moved:**
+  - About 90 of the 99 outlines now land on their sponge (checked by eye); before, nearly all stayed where the
+    sponge was in May.
+  - Result: 34 `ok`, 61 `check`, 4 `possibly gone` (before: 5, 60 and 34).
+  - The colonies TagLab could not find are flagged `check` or `possibly gone`.
+  - Colony and brick patches of the May map, turned and moved on purpose, were found within 1° and 3 mm.
+- **Speed:** about 1 s per colony on a laptop CPU (outline fitting about 0.8 s, the search about 0.25 s), less on an
+  NVIDIA GPU.
 
 ## Year-to-year matching (Compare menu and the comparison table)
 - **The comparison tables always match the colonies.** Every tool, and every Undo and Redo, keeps them up to date on
@@ -281,15 +303,18 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
 - **Shift + drag** a region to move it. A region that is not selected is selected first; dragging a selected one
   moves the whole selection. A plain drag still pans the map.
 - **Arrow keys** move the selected regions by 1 pixel, **Shift + arrow** by 10 pixels.
+- **`,` and `.`** turn the selected regions by 5° anticlockwise / clockwise around the centre of their box; **Shift**
+  (`<` / `>`) turns them by 90°. Quarter turns are exact, and turning back gives the same outline. Several selected
+  regions turn together. A region turned past the map border is moved back inside.
 - **Esc** cancels a drag in progress.
 - Regions move by whole pixels, so their area and perimeter don't change, and they can't leave the map.
 - They keep their id, so their matches in the comparison tables and their genets stay. Class, name, note, custom
   attributes and the "to check" mark stay too. Surface area and DEM metrics are cleared, because they were measured
   at the old place.
-- **Space** re-fits the outlines of the selected regions to the image at their new place (RITM, with the old outline
-  as the start). A new outline is used only if it is close to the old one (the same rule as Carry Regions Over);
+- **Space** re-fits the outlines of the selected regions to the image at their new place, as Carry Regions Over
+  does (RITM and colour; the outline can shrink or grow). A new outline is used only if it is close to the old one;
   otherwise the moved outline is kept, and a message says how many outlines were re-fitted.
-- **Undo:** one step per drag, per series of arrow presses on the same regions, and per re-fit.
+- **Undo:** one step per drag, per series of arrow presses and turns on the same regions, and per re-fit.
 
 ## Dictionaries
 - **`spongenursery.json`** (in the main folder, next to `FDEP.json`): the sponge nursery labels.

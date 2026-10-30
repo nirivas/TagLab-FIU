@@ -2204,12 +2204,9 @@ class TagLab(QMainWindow):
             else:
                 self.activeviewer.tools.applyTool()
 
-        elif event.key() in QtImageViewerPlus.NUDGE_KEYS and self.activeviewer is not None and \
-                self.activeviewer.tools.tool == "MOVEREGION" and len(self.activeviewer.selected_blobs) > 0:
-            # the arrow keys when the map does not have the focus
-            step = 10 if event.modifiers() & Qt.ShiftModifier else 1
-            dx, dy = QtImageViewerPlus.NUDGE_KEYS[event.key()]
-            self.activeviewer.nudgeSelected(dx * step, dy * step)
+        elif self.activeviewer is not None and self.activeviewer.moveRegionKey(event.key(), event.modifiers()):
+            # the Move Region keys (arrows, turn) when the map does not have the focus
+            pass
 
 
     def setBlobVisualization(self):
@@ -6521,12 +6518,13 @@ class TagLab(QMainWindow):
             return
 
         self.runCarryOver(dialog.sourceIndex(), dialog.targetIndex(), dialog.selectedBlobs(), dialog.refit(),
-                          dialog.useDem())
+                          dialog.useDem(), dialog.searchMm())
 
-    def runCarryOver(self, source_index, target_index, blobs, refit=True, use_dem=False):
+    def runCarryOver(self, source_index, target_index, blobs, refit=True, use_dem=False, search_mm=0.0):
         """
         Carry the given regions of the source map over to the target map (see source/CarryOver.py), then add them to
-        the target map, match them in the comparison table and open the review panel.
+        the target map, match them in the comparison table and open the review panel. With search_mm > 0, colonies
+        that were moved or turned by up to that distance (mm) are looked for.
         """
         if source_index == target_index or len(blobs) == 0:
             return
@@ -6562,7 +6560,7 @@ class TagLab(QMainWindow):
                 return
 
         ctx = CarryOver.CarryOverContext(source_image, target_image, source_qimage, target_qimage, placement,
-                                         self.taglab_dir, refit=refit, use_dem=use_dem,
+                                         self.taglab_dir, refit=refit, use_dem=use_dem, search_mm=search_mm,
                                          existing_blobs=target_image.annotations.seg_blobs)
         start = datetime.datetime.now()
         try:
@@ -6581,7 +6579,8 @@ class TagLab(QMainWindow):
             box.exec()
             return
 
-        logfile.info("[CARRYOVER] {:d} regions processed in {:.0f} s.".format(len(results), seconds))
+        logfile.info("[CARRYOVER] {:d} regions processed in {:.0f} s ({:d} found moved or turned).".format(
+            len(results), seconds, sum(1 for r in results if r.relocation is not None)))
         self.addCarriedColonies(source_image, target_image, results, placement)
 
     def addCarriedColonies(self, source_image, target_image, results, placement):
@@ -6865,7 +6864,7 @@ class TagLab(QMainWindow):
     @pyqtSlot(int)
     def refitCarriedColony(self, target_id):
         """
-        Re-fit the outline of the colony in the new map with RITM (its carry-over status does not change).
+        Re-fit the outline of the colony in the new map (refitSelectedRegions; its carry-over status does not change).
         """
         if not self.carryOverReviewPair():
             return
@@ -6888,10 +6887,11 @@ class TagLab(QMainWindow):
 
     def refitSelectedRegions(self, viewer=None, blobs=None):
         """
-        Re-fit the outlines of the regions (by default the selected regions of the active map) to the image with
-        RITM, as the carry-over does: the outline is the starting mask, with one click inside. A new outline is used
-        only if it overlaps the old one enough and its area does not change too much (CarryOver.acceptRefit). The
-        regions keep their ids (so their matches), class and attributes; the DEM metrics are dropped. All the
+        Re-fit the outlines of the regions (by default the selected regions of the active map) to the image as the
+        carry-over does (CarryOver.RitmRefit.refit: RITM and GrabCut candidates around the outline, the one agreeing
+        best is kept, so it can shrink or grow). A new outline is used only if it overlaps the old one enough and its
+        area does not change too much (CarryOver.acceptRefit); a region whose old outline was kept is left unchanged.
+        The regions keep their ids (so their matches), class and attributes; the DEM metrics are dropped. All the
         re-fits are one undo step. It returns the number of regions re-fitted.
         """
         viewer = self.activeviewer if viewer is None else viewer
@@ -6934,12 +6934,14 @@ class TagLab(QMainWindow):
                     break
                 refitted = ritm.refit(img, mask)
                 accepted, iou, ratio = CarryOver.acceptRefit(mask, refitted)
+                if ritm.choice == "old outline":
+                    accepted = False
                 results.append((blob, top, left, refitted if accepted else None))
                 progress(100.0 * (i + 1) / len(jobs))
             return results
 
         try:
-            results, stopped = self.runInBackground("Re-fitting {:d} outline(s) with RITM..".format(len(jobs)), work)
+            results, stopped = self.runInBackground("Re-fitting {:d} outline(s)..".format(len(jobs)), work)
         except Exception as e:
             logfile.error("[TOOL][MOVEREGION] Re-fit failed: " + str(e))
             box = QMessageBox()

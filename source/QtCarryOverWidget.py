@@ -8,7 +8,9 @@ import torch
 
 from PyQt5.QtCore import Qt, pyqtSlot
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QCheckBox, \
-    QListWidget, QListWidgetItem, QPushButton
+    QListWidget, QListWidgetItem, QPushButton, QSpinBox
+
+from source import CarryOver
 
 
 class QtCarryOverWidget(QDialog):
@@ -37,10 +39,28 @@ class QtCarryOverWidget(QDialog):
         self.listClasses.setMinimumHeight(140)
         self.listClasses.itemChanged.connect(self.updateInfo)
 
-        self.chkRefit = QCheckBox("Fit the outlines to the new map (RITM)")
+        self.chkMoved = QCheckBox("Colonies may have moved or turned (e.g. nursery bricks), search up to")
+        self.chkMoved.setChecked(True)
+        self.chkMoved.setToolTip("Each colony is also looked for around its place, turned by any angle and moved\n"
+                                 "by up to the distance given, matching the old map around it (the colony and what\n"
+                                 "it sits on) with the new one, and the elevation when both maps have a DEM.\n"
+                                 "It is moved only if it matches clearly better there than in place, and farther\n"
+                                 "moves need a better match. On a reef plot, where colonies stay put, it changes\n"
+                                 "little.")
+        self.chkMoved.toggled.connect(self.updateInfo)
+        self.spinSearch = QSpinBox()
+        self.spinSearch.setRange(1, 50)
+        self.spinSearch.setValue(int(round(CarryOver.DEFAULT_SEARCH_MM / 10.0)))
+        self.spinSearch.setSuffix(" cm")
+        self.spinSearch.setToolTip(self.chkMoved.toolTip())
+        self.chkMoved.toggled.connect(self.spinSearch.setEnabled)
+
+        self.chkRefit = QCheckBox("Fit the outlines to the new map (RITM + colour)")
         self.chkRefit.setChecked(True)
-        self.chkRefit.setToolTip("Each outline is adjusted to the new image with RITM, starting from the old one.\n"
-                                 "Off: the outlines are copied unchanged (only moved).")
+        self.chkRefit.setToolTip("Each outline is adjusted to the new image: RITM (with one and two clicks inside)\n"
+                                 "and GrabCut (colour) propose outlines, and the one agreeing best with the others\n"
+                                 "and with the old outline is kept, so it can shrink or grow (at most doubling its\n"
+                                 "area). Off: the outlines are copied unchanged (only moved).")
         self.chkRefit.toggled.connect(self.updateInfo)
 
         self.chkDem = QCheckBox("Use the elevation change (DEM)")
@@ -48,7 +68,8 @@ class QtCarryOverWidget(QDialog):
                                "as possibly gone. Needs a DEM in both maps.")
 
         explanation = QLabel(
-            "Each region of the first map is placed at the same position on the new map, its outline is fitted to "
+            "Each region of the first map is placed at the same position on the new map or, if it was moved or "
+            "turned (for example a nursery brick laid again), where it matches best nearby; its outline is fitted to "
             "the new image, and TagLab checks whether the colony is still there (structure, colour, texture and, "
             "with a DEM, height).\n\n"
             "The maps must already be aligned (for example with the Alignment Tool). Doubtful colonies are marked "
@@ -82,6 +103,11 @@ class QtCarryOverWidget(QDialog):
         layout.addSpacing(8)
         layout.addWidget(QLabel("Classes to carry over:"))
         layout.addWidget(self.listClasses)
+        layoutMoved = QHBoxLayout()
+        layoutMoved.addWidget(self.chkMoved)
+        layoutMoved.addWidget(self.spinSearch)
+        layoutMoved.addStretch()
+        layout.addLayout(layoutMoved)
         layout.addWidget(self.chkRefit)
         layout.addWidget(self.chkDem)
         layout.addSpacing(8)
@@ -110,6 +136,12 @@ class QtCarryOverWidget(QDialog):
 
     def useDem(self):
         return self.chkDem.isEnabled() and self.chkDem.isChecked()
+
+    def searchMm(self):
+        """
+        How far moved or turned colonies are looked for (mm); 0 = not looked for.
+        """
+        return 10.0 * self.spinSearch.value() if self.chkMoved.isChecked() else 0.0
 
     def selectedBlobs(self):
         classes = set(self.classes())
@@ -167,9 +199,11 @@ class QtCarryOverWidget(QDialog):
                          "them in the map settings if the maps should have the same pixel size.</font>")
 
         if n > 0:
-            per_colony = 0.5 if self.refit() else 0.1
+            per_colony = 0.9 if self.refit() else 0.1
             if torch.cuda.is_available():
-                per_colony = 0.15 if self.refit() else 0.1
+                per_colony = 0.4 if self.refit() else 0.1
+            if self.searchMm() > 0:
+                per_colony += 0.25
             minutes = n * per_colony / 60.0
             lines.append("{:d} regions; about {:s}.".format(n, "{:.0f} min".format(minutes) if minutes >= 1.5
                                                               else "a minute or less"))

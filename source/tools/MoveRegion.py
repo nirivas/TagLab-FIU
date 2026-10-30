@@ -4,9 +4,9 @@ from source.tools.Tool import Tool
 class MoveRegion(Tool):
     """
     Move the selected regions to another place of the map: SHIFT + drag (a region not selected is selected first),
-    or the arrow keys (see QtImageViewerPlus.nudgeSelected). The regions move by whole pixels, keeping their ids
-    (so their matches with the other maps). SPACE re-fits the outlines of the selected regions with RITM
-    (TagLab.refitSelectedRegions).
+    or the arrow keys (see QtImageViewerPlus.nudgeSelected); , and . turn them (QtImageViewerPlus.turnSelected).
+    The regions move by whole pixels, keeping their ids (so their matches with the other maps). SPACE re-fits the
+    outlines of the selected regions (TagLab.refitSelectedRegions).
     """
 
     def __init__(self, viewerplus):
@@ -18,7 +18,8 @@ class MoveRegion(Tool):
         message = "<p><i>Move regions to the right place</i></p>"
         message += "<p>- SHIFT + LMB drag: move the region (or all the selected regions)</p>"
         message += "<p>- Arrow keys: move the selected regions by 1 pixel (SHIFT + arrow: 10 pixels)</p>"
-        message += "<p>- SPACEBAR: re-fit the outline of the selected regions to the image (RITM)</p>"
+        message += "<p>- , and . : turn the selected regions by 5 degrees (SHIFT: 90 degrees)</p>"
+        message += "<p>- SPACEBAR: re-fit the outline of the selected regions to the image (RITM + colour)</p>"
         message += "<p>- ESC: cancel the move in progress</p>"
         self.tool_message = f'<div style="text-align: left;">{message}</div>'
 

@@ -58,8 +58,8 @@ class QtCarryOverReview(QWidget):
 
         helpLabel = QLabel("Each colony is shown in both maps with its old and new outline selected. Edit it with "
                            "the usual tools if needed (or change its class, e.g. to a dead-coral class), then keep "
-                           "or remove it. If it landed in the wrong place, Move it (SHIFT + drag or the arrow keys) "
-                           "and Re-fit its outline. Keys: N next, P previous, K keep, Delete remove.")
+                           "or remove it. If it landed in the wrong place, Move it (SHIFT + drag or the arrow keys; "
+                           ", and . turn it) and Re-fit its outline. Keys: N next, P previous, K keep, Delete remove.")
         helpLabel.setWordWrap(True)
 
         self.btnPrevious = QPushButton("< Previous (P)")
@@ -75,12 +75,12 @@ class QtCarryOverReview(QWidget):
         self.btnRemove.clicked.connect(self.removeCurrent)
         self.btnMove = QPushButton("Move (drag / arrows)")
         self.btnMove.setToolTip("Select the colony and activate the Move Region tool: SHIFT + drag it, or move it with "
-                                "the arrow keys (SHIFT + arrow: 10 pixels). Its status does not change: press K "
-                                "to keep it.")
+                                "the arrow keys (SHIFT + arrow: 10 pixels); , and . turn it by 5 degrees (SHIFT: 90 "
+                                "degrees). Its status does not change: press K to keep it.")
         self.btnMove.clicked.connect(self.moveCurrent)
         self.btnRefit = QPushButton("Re-fit outline")
-        self.btnRefit.setToolTip("Fit the outline to the new map with RITM (e.g. after moving it). Its status does "
-                                 "not change: press K to keep it.")
+        self.btnRefit.setToolTip("Fit the outline to the new map with RITM and colour (e.g. after moving it); it can "
+                                 "shrink or grow. Its status does not change: press K to keep it.")
         self.btnRefit.clicked.connect(self.refitCurrent)
         self.btnClose = QPushButton("Close")
         self.btnClose.clicked.connect(self.close)
