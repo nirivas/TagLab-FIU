@@ -428,6 +428,17 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
   - Running it again replaces a CPU version of PyTorch with the GPU version.
   - At the end it says whether PyTorch can use the GPU.
 - **`download_models.bat`:** downloads the AI models, which are not stored on GitHub. SAM is optional.
+  - It also finds incomplete model files (for example after an interrupted download): it compares each file's size
+    with the file on the server, lists it as "INCOMPLETE" and downloads it again. A file is replaced only when the
+    new download is complete.
+  - `download_models.bat --check` only lists the models (present / MISSING / INCOMPLETE).
+- **Interrupted model downloads:** `install_windows.bat` used to leave a cut model file under its real name when its
+  download stopped early, and later runs then skipped it as "already exists". It now downloads like
+  `download_models.bat`: a cut download leaves no model file, and a model cut by an earlier installation is
+  downloaded again.
+- **Train Your Network with a damaged base network:** when `models/deeplab-resnet.pth.tar` is incomplete or missing,
+  training stops with a message naming the file, its size and the complete size, and saying to run
+  `download_models.bat`. Before, it showed PyTorch's "unexpected EOF ... The file might be corrupted".
 - **`update.bat`:** updates from this version's GitHub repository. Replaced files are backed up first.
 - **Update notice:** TagLab shows a notice at startup when a newer version is available.
 - **`opentaglab.bat`:** works from any folder.

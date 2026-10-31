@@ -293,6 +293,30 @@ def updateProgressBar(progress_bar, prefix_message, num_iter, total_iter):
     QApplication.processEvents()
 
 
+BASE_NETWORK = "models/deeplab-resnet.pth.tar"
+BASE_NETWORK_SIZE = 474903453   # bytes of the complete file (download_models.EXPECTED_SIZES)
+
+
+def loadBaseNetwork(device):
+    """
+    The pretrained DeepLab weights every training starts from, with a clear message when the file is missing or
+    damaged (e.g. cut by an interrupted download).
+    """
+    if not os.path.isfile(BASE_NETWORK):
+        raise Exception("The base network " + BASE_NETWORK + " is missing. Run download_models.bat, then train again.")
+
+    try:
+        return torch.load(BASE_NETWORK, weights_only=False, map_location=device)
+    except Exception as e:
+        size = os.path.getsize(BASE_NETWORK)
+        if size == BASE_NETWORK_SIZE:
+            # the file is complete: the error is something else
+            raise
+        raise Exception("The base network {:s} is damaged or incomplete ({:,} bytes, the complete file has {:,}). "
+                        "Delete it and run download_models.bat, then train again."
+                        .format(BASE_NETWORK, size, BASE_NETWORK_SIZE)) from e
+
+
 def trainingNetwork(images_folder_train, labels_folder_train, images_folder_val, labels_folder_val,
                     labels_dictionary, target_classes, output_classes, save_network_as, classifier_name,
                     epochs, epochs_stage1, epochs_stage2, batch_sz, batch_mult, learning_rate, L2_penalty, validation_frequency, loss_to_use,
@@ -354,9 +378,9 @@ def trainingNetwork(images_folder_train, labels_folder_train, images_folder_val,
     net = DeepLab(backbone='resnet', output_stride=16, num_classes=output_classes)
 
     if torch.cuda.is_available():
-        state = torch.load("models/deeplab-resnet.pth.tar", weights_only=False, map_location=torch.device("cuda"))
+        state = loadBaseNetwork(torch.device("cuda"))
     else:
-        state = torch.load("models/deeplab-resnet.pth.tar", weights_only=False, map_location=torch.device("cpu"))
+        state = loadBaseNetwork(torch.device("cpu"))
 
     # RE-INIZIALIZE THE CLASSIFICATION LAYER WITH THE RIGHT NUMBER OF CLASSES, DON'T LOAD WEIGHTS OF THE CLASSIFICATION LAYER
     new_dictionary = state['state_dict']

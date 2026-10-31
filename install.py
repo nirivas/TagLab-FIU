@@ -331,29 +331,26 @@ else:
     os.remove(this_directory + '/' + filename_rasterio)
 
 # check for other networks
+# (download_models checks the file sizes: an interrupted download leaves only a .part file, never a cut model under
+# its real name, and a model cut by an earlier installation is downloaded again)
 print('Downloading networks...')
-base_url = 'http://taglab.isti.cnr.it/models/'
-from os import path
-import urllib.request
-this_directory = path.abspath(path.dirname(__file__))
+import download_models
 net_file_names = ['dextr_corals.pth', 'deeplab-resnet.pth.tar', 'ritm_corals.pth',
                   'pocillopora.net', 'porites.net', 'pocillopora_porite_montipora.net']
 
 if flag_install_SAM:
     net_file_names.append('sam_vit_h_4b8939.pth')
 
+os.makedirs(download_models.MODELS_DIR, exist_ok=True)
 for net_name in net_file_names:
-    filename_dextr_corals = 'dextr_corals.pth'
-    net_file = Path('models/' + net_name)
-    if not net_file.is_file(): #if file not exists
+    state, size, expected = download_models.modelStatus(net_name)
+    if state in ("MISSING", "INCOMPLETE"):
+        if state == "INCOMPLETE":
+            print(net_name + ' is incomplete ({:,} bytes, the complete file has {:,}).'.format(size, expected))
         try:
-            url_dextr = base_url + net_name
-            print('Downloading ' + url_dextr + '...')
-            opener = urllib.request.build_opener()
-            opener.addheaders = [('User-agent', 'Mozilla/5.0')]
-            urllib.request.install_opener(opener)
-            urllib.request.urlretrieve(url_dextr, 'models/' + net_name)
-        except:
-            raise Exception("Cannot download " + net_name + ".")
+            print('Downloading ' + download_models.BASE_URL + net_name + '...')
+            download_models.download(net_name)
+        except Exception as e:
+            raise Exception("Cannot download " + net_name + ": " + str(e))
     else:
         print(net_name + ' already exists.')
