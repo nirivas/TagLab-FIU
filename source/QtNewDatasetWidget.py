@@ -130,6 +130,24 @@ class QtNewDatasetWidget(QWidget):
 
         ###########################################################
 
+        # classes merged (or left out) in the exported tiles, see QtClassMergeWidget
+        self.lblClasses = QLabel("Classes:")
+        self.lblClasses.setFixedWidth(TEXT_SPACE)
+        self.lblClasses.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.lblMergeSummary = QLabel("")
+        self.lblMergeSummary.setWordWrap(True)
+        self.lblMergeSummary.setMinimumWidth(LINEWIDTH)
+        self.btnMergeClasses = QPushButton("Merge classes...")
+        self.btnMergeClasses.setToolTip("Export several classes as one (e.g. Boat and Scuba of the same species), "
+                                        "or leave classes out; the regions keep their own classes")
+
+        layoutClasses = QHBoxLayout()
+        layoutClasses.addWidget(self.lblClasses)
+        layoutClasses.addWidget(self.lblMergeSummary, 1)
+        layoutClasses.addWidget(self.btnMergeClasses, 0, Qt.AlignTop)
+
+        ###########################################################
+
         layoutH2 = QHBoxLayout()
         self.checkShowTiles = QCheckBox("Show exported tiles")
         layoutH2.addStretch()
@@ -151,6 +169,7 @@ class QtNewDatasetWidget(QWidget):
 
         layoutV = QVBoxLayout()
         layoutV.addLayout(layoutH1)
+        layoutV.addLayout(layoutClasses)
         layoutV.addLayout(layoutH2)
         layoutV.addLayout(layoutH3)
         self.setLayout(layoutV)
@@ -201,5 +220,10 @@ class QtNewDatasetWidget(QWidget):
     def setTilePrefix(self, prefix):
 
         self.editTilePrefix.setText(prefix)
+
+    def setMergeSummary(self, text, details=""):
+
+        self.lblMergeSummary.setText(text)
+        self.lblMergeSummary.setToolTip(details)
 
 

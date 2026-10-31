@@ -66,10 +66,33 @@ under the same GPL-3 licence. It changes the following.
   and test areas correctly, and it is much faster on large maps.
 - **Dataset export warning:** export warns about classes coloured black, which would be confused with the
   unlabelled background.
+- **Merge classes when exporting a training dataset** (Export New Training Dataset > "Merge classes..."):
+  - Each class gets an "Export as" name. Classes with the same name become one class in the exported tiles, for
+    example "Vase (Boat)" + "Vase (Scuba)" → "Vase". "Drop the (…) part of the names" does this for all classes at
+    once. "Background" leaves a class out.
+  - The regions keep their own classes, so the CSVs, the comparison tables and the year-to-year tracking still
+    show Boat and Scuba.
+  - A new name gets a colour of its own (the average of its classes, or one you pick). It must not be black or
+    used by another label.
+  - On export, the new names are added to the project's labels, so that Train Your Network and the classifier
+    find them. The dataset folder also gets `classes.json`, which lists each exported class and the classes it was
+    made from. The merges are saved with the project and reused at the next export.
+  - Train on a project that has these labels: save the project after exporting and open it on the training
+    computer. To use the classifier in another project, add the same labels there with the same colours.
 - **Training:**
   - It runs all the requested epochs and always saves a network.
   - It handles small validation and test sets, and trains all the intended layers.
   - It no longer needs an internet download.
+- **Train Your Network window:**
+  - Choosing the dataset folder a second time no longer crashes ("wrapped C/C++ object of type QLabel has been
+    deleted").
+  - The classes are found by matching the colours of the dataset's label images with the labels of the open
+    project. If you load the project's dictionary after opening the window, the class list now updates the next
+    time you open it; before, it kept showing only "Background".
+  - When no class of the project is found in the dataset (only "Background 100%"), a message says why and what to
+    do, and Train is refused instead of training a network with no classes.
+  - A folder typed by hand is checked when you press Train, and a dataset without tiles gives a message instead of
+    an error.
 - **Classification:**
   - It keeps TagLab open, puts the results on the correct map in split screen, and no longer forces a save.
   - `batch_processing.py` works.

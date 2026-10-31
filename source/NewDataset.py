@@ -35,9 +35,154 @@ import sys
 import json
 from cv2 import fillPoly
 import datetime
+import re
 from skimage.measure import label, regionprops
 from source.Blob import Blob
 from source.Label import Label
+
+
+# name of the background class in the target classes; a class exported as "Background" is left out (painted black)
+BACKGROUND = "Background"
+
+
+def baseName(name):
+	"""
+	The class name without a trailing " (...)": "Vase (Boat)" -> "Vase".
+	"""
+	match = re.match(r"^(.*\S)\s*\([^()]*\)\s*$", name)
+	return match.group(1) if match else name
+
+
+def mergedTargetClasses(target_classes, class_map):
+	"""
+	The target classes once the classes are exported with the names of class_map ({class: exported name}):
+	Background plus the exported names, coded 0..n.
+	"""
+	names = set()
+	for key in target_classes.keys():
+		if key == BACKGROUND:
+			continue
+		name = class_map.get(key, key)
+		if name != BACKGROUND:
+			names.add(name)
+
+	merged = {BACKGROUND: 0}
+	for i, name in enumerate(sorted(names)):
+		merged[name] = i + 1
+	return merged
+
+
+def suggestColor(source_colors, used_colors):
+	"""
+	Colour for a merged class: the average colour of its classes, moved slightly until no other label uses it and it
+	is not black (the background of the label images).
+	"""
+	used = {tuple(int(v) for v in color) for color in used_colors}
+	used.add((0, 0, 0))
+	if len(source_colors) > 0:
+		base = [int(round(sum(color[k] for color in source_colors) / len(source_colors))) for k in range(3)]
+	else:
+		base = [128, 128, 128]
+
+	for d in range(0, 256, 8):
+		for dr in (0, d, -d):
+			for dg in (0, d, -d):
+				for db in (0, d, -d):
+					color = tuple(min(255, max(0, base[k] + offset)) for k, offset in enumerate((dr, dg, db)))
+					if color not in used:
+						return list(color)
+	return [255, 255, 255]
+
+
+def exportLabels(labels, class_map, colors):
+	"""
+	The labels of an exported dataset: the labels that are not merged into another name, plus one Label for each
+	new name of class_map (its fill from colors, the border of its first class). A name that is already a label keeps
+	that label (and its colour).
+	"""
+	result = {}
+	for name, label in labels.items():
+		if name not in class_map:
+			result[name] = label
+
+	for source, name in class_map.items():
+		if name == BACKGROUND or name in result:
+			continue
+		first = labels.get(source)
+		border = list(first.border) if first is not None else [200, 200, 200]
+		fill = colors.get(name)
+		if fill is None:
+			sources = [labels[key].fill for key, value in class_map.items() if value == name and key in labels]
+			fill = suggestColor(sources, [label.fill for label in result.values()])
+		result[name] = Label(name, name, fill=[int(v) for v in fill], border=border)
+
+	return result
+
+
+def mergeErrors(labels, class_map, colors):
+	"""
+	What prevents exporting with class_map ({class: exported name}) and colors ({new name: [r, g, b]}): empty names,
+	"Empty", a class merged into a name that is itself merged away, and a new name with no colour, black, or a colour
+	that another label (or another new name) already uses. Returns a list of messages.
+	"""
+	errors = []
+	for source, name in class_map.items():
+		if name.strip() == "":
+			errors.append('"{:s}": the name is empty.'.format(source))
+		elif name == "Empty":
+			errors.append('"{:s}": "Empty" is not allowed; choose "Background" to leave the class out.'.format(source))
+		elif name != BACKGROUND and class_map.get(name, name) != name:
+			errors.append('"{:s}" is exported as "{:s}", which is itself exported as "{:s}".'.format(source, name, class_map[name]))
+
+	new_names = sorted({name for name in class_map.values()
+						if name.strip() != "" and name not in (BACKGROUND, "Empty") and name not in labels})
+	seen = {}
+	for name in new_names:
+		color = colors.get(name)
+		if color is None:
+			errors.append('"{:s}": no colour.'.format(name))
+			continue
+		color = tuple(int(v) for v in color)
+		users = [key for key, label in labels.items() if tuple(int(v) for v in label.fill) == color]
+		if color == (0, 0, 0):
+			errors.append('"{:s}": black is the background of the label images; choose another colour.'.format(name))
+		elif len(users) > 0:
+			errors.append('"{:s}": the colour is already used by "{:s}".'.format(name, users[0]))
+		elif color in seen:
+			errors.append('"{:s}": the colour is already used by "{:s}".'.format(name, seen[color]))
+		seen[color] = name
+
+	return errors
+
+
+def mergeSummary(class_names, class_map, short=False):
+	"""
+	One line describing how the classes of a map are exported, e.g.
+	"12 classes → 6: Vase = Vase (Boat) + Vase (Scuba); ...; left out (background): Brick", or with short=True
+	"12 classes → 6: 5 merged, 1 left out".
+	"""
+	count = len(class_names)
+	classes_text = "1 class" if count == 1 else "{:d} classes".format(count)
+
+	groups = {}
+	for name in class_names:
+		groups.setdefault(class_map.get(name, name), []).append(name)
+	left_out = groups.pop(BACKGROUND, [])
+	changed = [(target, sources) for target, sources in sorted(groups.items()) if sources != [target]]
+	if len(changed) == 0 and len(left_out) == 0:
+		return classes_text + ", exported as they are"
+
+	if short:
+		merged = sum(1 for target, sources in changed if len(sources) > 1)
+		renamed = len(changed) - merged
+		parts = [text.format(n) for n, text in [(merged, "{:d} merged"), (renamed, "{:d} renamed"),
+												 (len(left_out), "{:d} left out")] if n > 0]
+		return "{:s} → {:d}: {:s}".format(classes_text, len(groups), ", ".join(parts))
+
+	parts = [target + " = " + " + ".join(sources) for target, sources in changed]
+	if len(left_out) > 0:
+		parts.append("left out (background): " + ", ".join(left_out))
+	return "{:s} → {:d}: {:s}".format(classes_text, len(groups), "; ".join(parts))
 
 
 class NewDataset(object):
@@ -45,7 +190,7 @@ class NewDataset(object):
 	This class handles the functionalities to create a new dataset.
 	"""
 
-	def __init__(self, ortho_image, labels, image_info, tile_size, step, data_format):
+	def __init__(self, ortho_image, labels, image_info, tile_size, step, data_format, class_map=None):
 
 		self.ortho_image = ortho_image  # QImage
 		self.blobs = image_info.annotations.seg_blobs
@@ -54,6 +199,9 @@ class NewDataset(object):
 		self.step = step                     # step should be the same or a submultiple of crop_size
 		self.labels_dict = labels
 		self.image_info = image_info
+
+		# {class: exported name}: classes merged under another name, or left out as "Background"
+		self.class_map = dict(class_map) if class_map else {}
 
 		# area to consider for the tiles cutting operation
 		# export for DeepLab -> the export area is adjusted such that the cropped tiles MUST BE inside the export area
@@ -104,6 +252,13 @@ class NewDataset(object):
 		# used to create the dataset.YAML file at the end of the export
 		self.yolo_class_mapper = {}
 		self.yolo_class_counter = 0
+
+	def exportClass(self, blob):
+		"""
+		The class of the blob in the exported dataset ("Empty" for a class left out as background).
+		"""
+		name = self.class_map.get(blob.class_name, blob.class_name)
+		return "Empty" if name == BACKGROUND else name
 
 
 	def exportAreaCropAndRescale(self, current_pixel_size, target_pixel_size, export_area):
@@ -263,7 +418,7 @@ class NewDataset(object):
 			area = 0.0
 			if key != "Background":
 				for blob in self.blobs:
-					if blob.class_name == key:
+					if self.exportClass(blob) == key:
 						area += blob.area
 
 			freq = area / area_map
@@ -328,7 +483,7 @@ class NewDataset(object):
 			areas = []
 			if self.frequencies is None or self.frequencies.get(key, 0.0) > 0.0:
 				for blob in self.blobs:
-					if blob.class_name == key and (blob.qpath_gitem is None or blob.qpath_gitem.isVisible()):
+					if self.exportClass(blob) == key and (blob.qpath_gitem is None or blob.qpath_gitem.isVisible()):
 						boxes.append([(blob.bbox[0] - y0) * s, (blob.bbox[1] - x0) * s, blob.bbox[2] * s, blob.bbox[3] * s])
 						areas.append(blob.area * s * s)
 			boxes = np.array(boxes, dtype=np.float64).reshape(-1, 4)
@@ -676,10 +831,11 @@ class NewDataset(object):
 
 			if blob.qpath_gitem.isVisible():
 
-				if blob.class_name == "Empty":
+				class_name = self.exportClass(blob)
+				if class_name == "Empty":
 					rgb = qRgb(0, 0, 0)
 				else:
-					class_color = labels_dictionary[blob.class_name].fill
+					class_color = labels_dictionary[class_name].fill
 					rgb = qRgb(class_color[0], class_color[1], class_color[2])
 
 				painter.setBrush(QBrush(QColor(rgb)))
@@ -694,7 +850,7 @@ class NewDataset(object):
 			for i, blob in enumerate(self.blobs):
 
 				if blob.qpath_gitem.isVisible():
-					if blob.class_name != "Empty":
+					if self.exportClass(blob) != "Empty":
 						points = blob.contour.round().astype(np.int32)
 						fillPoly(self.id_image, pts=[points], color = blob.id)
 						for inner_contour in blob.inner_contours:
@@ -1190,7 +1346,7 @@ class NewDataset(object):
 		for i, class_name in enumerate(classes_to_sample):
 			radius = radii[i]
 			for blob in self.blobs:
-				if blob.class_name == class_name:
+				if self.exportClass(blob) == class_name:
 					samples = self.sampleBlobWPoissonDisk(blob, samples, radius)
 					txt = str(len(samples)) + "\r"
 					sys.stdout.write(txt)
@@ -1211,7 +1367,7 @@ class NewDataset(object):
 		samples = []
 		for class_name in classes_to_sample:
 			for blob in self.blobs:
-				if blob.class_name == class_name:
+				if self.exportClass(blob) == class_name:
 					samples = self.sampleBlobWimportanceSampling(blob, samples)
 					txt = str(len(samples)) + "\r"
 					sys.stdout.write(txt)

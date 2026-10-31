@@ -102,7 +102,8 @@ from source.Project import Project, loadProject, writeTextSafely
 from source.Point import Point
 from source.Image import Image
 from source.MapClassifier import MapClassifier
-from source.NewDataset import NewDataset
+from source.NewDataset import NewDataset, mergedTargetClasses, exportLabels, mergeErrors, mergeSummary, BACKGROUND
+from source.QtClassMergeWidget import QtClassMergeWidget
 from source.QtGridWidget import QtGridWidget
 from source.QtDictionaryWidget import QtDictionaryWidget
 from source.QtRegionAttributesWidget import QtRegionAttributesWidget
@@ -5918,6 +5919,7 @@ class TagLab(QMainWindow):
                     self.newDatasetWidget.setWindowModality(Qt.NonModal)
                     self.newDatasetWidget.btnChooseExportArea.clicked.connect(self.enableAreaSelection)
                     self.newDatasetWidget.btnExport.clicked.connect(self.exportNewDataset)
+                    self.newDatasetWidget.btnMergeClasses.clicked.connect(self.openClassMerge)
                     self.newDatasetWidget.btnCancel.clicked.connect(self.disableAreaSelection)
                     self.newDatasetWidget.closed.connect(self.disableAreaSelection)
                     select_area_tool = self.activeviewer.tools.tools["SELECTAREA"]
@@ -5925,7 +5927,90 @@ class TagLab(QMainWindow):
                     genutils.disconnectSignal(select_area_tool, "rectChanged", select_area_tool.rectChanged)
                     select_area_tool.rectChanged[int, int, int, int].connect(self.updateExportDatasetArea)
 
+                self.updateMergeSummary()
                 self.newDatasetWidget.show()
+
+    # project.metadata key of the classes merged in the exported datasets: {"map": {class: exported name},
+    # "colors": {new name: [r, g, b]}}
+    DATASET_MERGES_KEY = "dataset_class_merges"
+
+    def datasetClasses(self):
+        """
+        {class: regions} of the visible, non-Empty regions of the active map (the classes a dataset export paints).
+        """
+        counts = {}
+        for blob in self.activeviewer.annotations.seg_blobs:
+            if blob.class_name != "Empty" and blob.qpath_gitem is not None and blob.qpath_gitem.isVisible():
+                counts[blob.class_name] = counts.get(blob.class_name, 0) + 1
+        return counts
+
+    def storedClassMerges(self):
+
+        merges = self.project.metadata.get(self.DATASET_MERGES_KEY)
+        if not isinstance(merges, dict):
+            return {"map": {}, "colors": {}}
+        return {"map": dict(merges.get("map", {})),
+                "colors": {name: list(color) for name, color in merges.get("colors", {}).items()}}
+
+    def classMergesForMap(self, counts):
+        """
+        The stored merges limited to the given classes (those of the map to export).
+        """
+        merges = self.storedClassMerges()
+        class_map = {name: target for name, target in merges["map"].items() if name in counts}
+        targets = set(class_map.values())
+        colors = {name: color for name, color in merges["colors"].items() if name in targets}
+        return {"map": class_map, "colors": colors}
+
+    def updateMergeSummary(self):
+
+        if self.newDatasetWidget is not None and self.activeviewer is not None and self.activeviewer.image is not None:
+            counts = self.datasetClasses()
+            merges = self.classMergesForMap(counts)
+            names = sorted(counts.keys())
+            self.newDatasetWidget.setMergeSummary(mergeSummary(names, merges["map"], short=True),
+                                                  mergeSummary(names, merges["map"]))
+
+    @pyqtSlot()
+    def openClassMerge(self):
+        """
+        Export New Training Dataset > Merge classes...: chooses the name each class is exported with (stored in the
+        project, used by exportNewDataset).
+        """
+        if self.activeviewer is None or self.activeviewer.image is None:
+            return
+
+        counts = self.datasetClasses()
+        if len(counts) == 0:
+            msgBox = QMessageBox()
+            msgBox.setWindowTitle(self.TAGLAB_VERSION)
+            msgBox.setText("There are no classified regions on this map.")
+            msgBox.exec()
+            return
+
+        dialog = QtClassMergeWidget(self.project.labels, counts, self.classMergesForMap(counts),
+                                    parent=self.newDatasetWidget)
+        dialog.setWindowModality(Qt.ApplicationModal)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        chosen = dialog.merges()
+        # the merges of classes that are not on this map are kept
+        stored = self.storedClassMerges()
+        class_map = {name: target for name, target in stored["map"].items() if name not in counts}
+        class_map.update(chosen["map"])
+        targets = set(class_map.values())
+        colors = {name: color for name, color in stored["colors"].items() if name in targets}
+        colors.update(chosen["colors"])
+        if len(class_map) > 0:
+            self.project.metadata[self.DATASET_MERGES_KEY] = {"map": class_map, "colors": colors}
+        else:
+            self.project.metadata.pop(self.DATASET_MERGES_KEY, None)
+
+        summary = mergeSummary(sorted(counts.keys()), chosen["map"])
+        logfile.info("[DATASET] Class merges for '{:s}': {:s}".format(self.activeviewer.image.name,
+                                                                     summary.replace("\u2192", "->")))
+        self.updateMergeSummary()
 
     @pyqtSlot(int, int, int, int)
     def updateExportDatasetArea(self, x, y, width, height):
@@ -5948,8 +6033,25 @@ class TagLab(QMainWindow):
 
             target_classes = training.createTargetClasses(self.activeviewer.annotations)
 
+            # classes merged (or left out) in the tiles: the stored merges of the classes on this map, with labels
+            # for the new names (added to the project after the export)
+            class_counts = self.datasetClasses()
+            merges = self.classMergesForMap(class_counts)
+            class_map = merges["map"]
+            errors = mergeErrors(self.project.labels, class_map, merges["colors"])
+            if len(errors) > 0:
+                msgBox = QMessageBox()
+                msgBox.setWindowTitle(self.TAGLAB_VERSION)
+                msgBox.setIcon(QMessageBox.Warning)
+                msgBox.setText("The class merges can't be used:\n\n" + "\n".join(errors) +
+                               "\n\nFix them with Merge classes...")
+                msgBox.exec()
+                return
+            export_labels = exportLabels(self.project.labels, class_map, merges["colors"])
+            target_classes = mergedTargetClasses(target_classes, class_map)
+
             # black is the color of the unlabeled background in the label images
-            black_classes = NewDataset.classesWithBackgroundColor(target_classes, self.project.labels)
+            black_classes = NewDataset.classesWithBackgroundColor(target_classes, export_labels)
             if len(black_classes) > 0:
                 msgBox = QMessageBox()
                 msgBox.setWindowTitle(self.TAGLAB_VERSION)
@@ -5977,10 +6079,11 @@ class TagLab(QMainWindow):
             # the image shown in the active viewer is the one exported
             current_image = self.activeviewer.image
 
-            new_dataset = NewDataset(self.activeviewer.img_map, self.project.labels, current_image,
-                                     tile_size=1024, step=512, data_format=self.newDatasetWidget.comboDataFormat.currentText())
+            new_dataset = NewDataset(self.activeviewer.img_map, export_labels, current_image,
+                                     tile_size=1024, step=512, data_format=self.newDatasetWidget.comboDataFormat.currentText(),
+                                     class_map=class_map)
 
-            new_dataset.createLabelImage(self.project.labels)
+            new_dataset.createLabelImage(export_labels)
             new_dataset.computeFrequencies(target_classes)
             target_pixel_size = self.newDatasetWidget.getTargetScale()
 
@@ -6042,12 +6145,46 @@ class TagLab(QMainWindow):
             fl.write(str(target_pixel_size))
             fl.close()
 
+            self.saveDatasetClasses(basename, class_counts, class_map, export_labels)
+
             self.deleteProgressBar()
             self.deleteNewDatasetWidget()
 
             self.disableAreaSelection()
 
             QApplication.restoreOverrideCursor()
+
+    def saveDatasetClasses(self, folder, class_counts, class_map, export_labels):
+        """
+        After a dataset export: the new names of merged classes become labels of the project (Train Your Network and
+        the classifier look the classes up there), and classes.json in the dataset folder lists each exported class,
+        its colour and the classes it was made of.
+        """
+        added = []
+        for name in sorted(set(class_map.values())):
+            if name != BACKGROUND and name not in self.project.labels and name in export_labels:
+                self.project.labels[name] = export_labels[name]
+                added.append(name)
+        if len(added) > 0:
+            self.labels_widget.active_image = None
+            self.labels_widget.setLabels(self.project, self.activeviewer.image)
+
+        groups = {}
+        for name in sorted(class_counts.keys()):
+            groups.setdefault(class_map.get(name, name), []).append(name)
+        left_out = groups.pop(BACKGROUND, [])
+        classes = []
+        for name in sorted(groups.keys()):
+            label = export_labels.get(name)
+            classes.append({"name": name, "color": list(label.fill) if label is not None else None,
+                            "from": groups[name]})
+        data = {"map": self.activeviewer.image.name, "classes": classes, "background": left_out}
+        with open(os.path.join(folder, "classes.json"), "w") as f:
+            json.dump(data, f, indent=2)
+
+        summary = mergeSummary(sorted(class_counts.keys()), class_map)
+        logfile.info("[DATASET] Exported '{:s}' to {:s}: {:s}; labels added to the project: {:s}".format(
+            self.activeviewer.image.name, folder, summary.replace("\u2192", "->"), ", ".join(added) if added else "none"))
 
     @pyqtSlot()
     def trainNewNetwork(self):
@@ -6190,6 +6327,8 @@ class TagLab(QMainWindow):
             self.trainYourNetworkWidget = QtTYNWidget(self.project.labels, self.TAGLAB_VERSION, parent=self)
             self.trainYourNetworkWidget.setWindowModality(Qt.WindowModal)
             self.trainYourNetworkWidget.launchTraining.connect(self.trainNewNetwork)
+        # a dictionary loaded since the dialog was created replaces the labels: find the classes again
+        self.trainYourNetworkWidget.setProjectLabels(self.project.labels)
         self.trainYourNetworkWidget.show()
 
 

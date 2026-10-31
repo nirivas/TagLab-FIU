@@ -89,10 +89,9 @@ class QtTYNWidget(QWidget):
         self.lblBS.setFixedWidth(TEXT_SPACE)
         self.lblBS.setAlignment(Qt.AlignRight)
 
-        self.lblTotalBackground = QLabel("Cumulative background: ")
-        self.lblTotalBackground.setStyleSheet("QLabel { background-color : rgb(40,40,40); color : white; }")
-        self.lblTotalBackgroundValue = QLabel("")
-        self.lblTotalBackgroundValue.setStyleSheet("QLabel { background-color : rgb(40,40,40); color : white; }")
+        # created with each list of classes: Qt deletes them with the group box they are in
+        self.lblTotalBackground = None
+        self.lblTotalBackgroundValue = None
 
         ##### Edits
 
@@ -350,23 +349,65 @@ class QtTYNWidget(QWidget):
         folderName = QFileDialog.getExistingDirectory(self, "Choose a Folder to Export the Dataset", "")
         if folderName:
             self.editDatasetFolder.setText(folderName)
+            self.refreshClasses()
 
-            box = QMessageBox()
-            box.setWindowTitle(self.TAGLAB_VERSION)
-            box.setText("The dataset will be analyzed. This may take some minutes, please wait.. ")
-            box.setStandardButtons(QMessageBox.NoButton)
-            box.show()
-            QApplication.processEvents()
-            QApplication.setOverrideCursor(Qt.WaitCursor)
+    def refreshClasses(self):
+        """
+        It analyzes the dataset again and rebuilds the list of the classes to recognize.
+        """
+
+        box = QMessageBox()
+        box.setWindowTitle(self.TAGLAB_VERSION)
+        box.setText("The dataset will be analyzed. This may take some minutes, please wait.. ")
+        box.setStandardButtons(QMessageBox.NoButton)
+        box.show()
+        QApplication.processEvents()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
             self.analyzeDataset()
+        finally:
             QApplication.restoreOverrideCursor()
             box.close()
 
-            self.layoutClasses.removeWidget(self.groupbox_classes)
-            self.groupbox_classes.setParent(None)
-            self.groupbox_classes = None
-            self.groupbox_classes = self.createClassesToRecognizeWidgets()
-            self.layoutClasses.insertWidget(1, self.groupbox_classes)
+        self.layoutClasses.removeWidget(self.groupbox_classes)
+        self.groupbox_classes.setParent(None)
+        self.groupbox_classes = None
+        self.groupbox_classes = self.createClassesToRecognizeWidgets()
+        self.layoutClasses.insertWidget(1, self.groupbox_classes)
+
+        if self.noClassFound():
+            self.showNoClassMessage()
+
+    def setProjectLabels(self, labels):
+        """
+        It uses the labels of the open project. Loading a dictionary replaces them, so the classes of the dataset
+        already chosen are found again.
+        """
+
+        if labels is self.project_labels:
+            return
+
+        self.project_labels = labels
+        dataset_folder = self.editDatasetFolder.text()
+        if dataset_folder != "" and os.path.exists(dataset_folder):
+            self.refreshClasses()
+
+    def noClassFound(self):
+        """
+        True when the dataset has label tiles but none of their colours is a label of the open project.
+        """
+
+        return self.freq_classes is not None and len(self.freq_classes) < 2
+
+    def showNoClassMessage(self):
+
+        msgBox = QMessageBox()
+        msgBox.setWindowTitle(self.TAGLAB_VERSION)
+        msgBox.setText("No class of the open project was found in this dataset: the colours of its label images "
+                       "don't match the labels of the project.\n\n"
+                       "Open the project the dataset was exported from, or load its dictionary in "
+                       "Project > Labels Dictionary Editor, then open Train Your Network again.")
+        msgBox.exec()
 
 
     @pyqtSlot()
@@ -443,6 +484,11 @@ class QtTYNWidget(QWidget):
             grid_layout = QGridLayout()
             groupbox.setLayout(grid_layout)
 
+            self.lblTotalBackground = QLabel("Cumulative background: ")
+            self.lblTotalBackground.setStyleSheet("QLabel { background-color : rgb(40,40,40); color : white; }")
+            self.lblTotalBackgroundValue = QLabel("")
+            self.lblTotalBackgroundValue.setStyleSheet("QLabel { background-color : rgb(40,40,40); color : white; }")
+
             self.checkboxes = []
             CLASSES_PER_ROW = 3
             for i, key in enumerate(self.freq_classes.keys()):
@@ -502,6 +548,9 @@ class QtTYNWidget(QWidget):
     @pyqtSlot()
     def updateCumulativeBackground(self):
 
+        if self.lblTotalBackgroundValue is None:
+            return
+
         perc = 0.0
         for checkbox in self.checkboxes:
             if not checkbox.isChecked():
@@ -538,9 +587,23 @@ class QtTYNWidget(QWidget):
             msgBox.exec()
             return
 
+        # a folder typed by hand has not been analyzed yet
+        if self.target_classes is None:
+            self.refreshClasses()
+            if self.target_classes is None:
+                return
+
+        if self.noClassFound():
+            self.showNoClassMessage()
+            return
+
         self.launchTraining.emit()
 
     def analyzeDataset(self):
+
+        # the classes of the previous folder or labels no longer apply
+        self.target_classes = None
+        self.freq_classes = None
 
         # check dataset
         dataset_folder = self.editDatasetFolder.text()
@@ -566,6 +629,13 @@ class QtTYNWidget(QWidget):
         # CLASSES TO RECOGNIZE (label name - label code)
         labels_folder = os.path.join(dataset_folder, "training")
         labels_folder = os.path.join(labels_folder, "labels")
+        if training.count_png_files(labels_folder) == 0:
+            msgBox = QMessageBox()
+            msgBox.setWindowTitle(self.TAGLAB_VERSION)
+            msgBox.setText("The training folder of this dataset has no tiles. Please, export a new dataset.")
+            msgBox.exec()
+            return
+
         target_classes, freq_classes = CoralsDataset.importClassesFromDataset(labels_folder, self.project_labels)
 
         self.target_classes = target_classes
