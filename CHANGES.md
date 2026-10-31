@@ -74,11 +74,18 @@ under the same GPL-3 licence. It changes the following.
     show Boat and Scuba.
   - A new name gets a colour of its own (the average of its classes, or one you pick). It must not be black or
     used by another label.
-  - On export, the new names are added to the project's labels, so that Train Your Network and the classifier
-    find them. The dataset folder also gets `classes.json`, which lists each exported class and the classes it was
-    made from. The merges are saved with the project and reused at the next export.
-  - Train on a project that has these labels: save the project after exporting and open it on the training
-    computer. To use the classifier in another project, add the same labels there with the same colours.
+  - The dataset folder gets `classes.json`, which lists each exported class, its colour and the classes it was made
+    from. The merges are saved with the project and reused at the next export.
+  - The new names are also added to the project's labels; a message at the end of the export lists them. Save the
+    project to keep them.
+- **Training doesn't depend on the open project:** Train Your Network reads the class names and colours from the
+  dataset's `classes.json`, so a dataset trains with any project open, merged classes included. The window says
+  where the classes come from. Datasets exported before this version have no `classes.json` and still use the
+  labels of the open project.
+- **Classifiers remember their class colours:** a classifier trained with this version can be applied to any
+  project. When some of its classes are not labels of the project, TagLab asks to add them, with their training
+  colours, and the regions get those classes. The Preview uses the colours without changing the project, and
+  `batch_processing.py` adds the labels by itself. Classifiers trained before still need the labels in the project.
 - **Training:**
   - It runs all the requested epochs and always saves a network.
   - It handles small validation and test sets, and trains all the intended layers.
@@ -86,11 +93,11 @@ under the same GPL-3 licence. It changes the following.
 - **Train Your Network window:**
   - Choosing the dataset folder a second time no longer crashes ("wrapped C/C++ object of type QLabel has been
     deleted").
-  - The classes are found by matching the colours of the dataset's label images with the labels of the open
-    project. If you load the project's dictionary after opening the window, the class list now updates the next
-    time you open it; before, it kept showing only "Background".
-  - When no class of the project is found in the dataset (only "Background 100%"), a message says why and what to
-    do, and Train is refused instead of training a network with no classes.
+  - For a dataset without `classes.json`, the classes are found by matching the colours of its label images with
+    the labels of the open project. If you load the project's dictionary after opening the window, the class list
+    now updates the next time you open it; before, it kept showing only "Background".
+  - When no class is found in the dataset (only "Background 100%"), a message says why and what to do, and Train
+    is refused instead of training a network with no classes.
   - A folder typed by hand is checked when you press Train, and a dataset without tiles gives a message instead of
     an error.
 - **Classification:**

@@ -37,6 +37,35 @@ from PyQt5.QtCore import QCoreApplication, Qt, QObject, QThread, pyqtSlot, pyqtS
 from PyQt5.QtGui import QPainter, QImage, QColor, QPixmap, qRgb, qRed, qGreen, qBlue
 
 from source import genutils
+from source.Label import Label
+from source.NewDataset import suggestColor
+
+
+def classifierLabels(classifier_info, labels):
+    """
+    The labels a classifier is applied with: the given labels, plus a label for each class of the classifier that is
+    not one of them, coloured as in its training ("Colors", stored with the classifiers trained since 10/2026). A
+    colour that another label already uses is moved, since the label map is read back by colour. It returns
+    (labels, added names, missing names without a stored colour).
+    """
+    colors = classifier_info.get("Colors", {})
+    result = dict(labels)
+    added = []
+    unknown = []
+    for name in classifier_info["Classes"]:
+        if name == "Background" or name in labels:
+            continue
+        color = colors.get(name)
+        if color is None:
+            unknown.append(name)
+            continue
+        fill = [int(c) for c in color]
+        used = [[int(c) for c in label.fill] for label in result.values()]
+        if fill in used or fill == [0, 0, 0]:
+            fill = suggestColor([fill], used)
+        result[name] = Label(id=name, name=name, fill=fill)
+        added.append(name)
+    return result, added, unknown
 
 
 class MapClassifier(QObject):

@@ -21,6 +21,44 @@ torch.backends.cudnn.benchmark = False
 
 import glob
 import os
+import json
+import logging
+from source.Label import Label
+
+logfile = logging.getLogger("tool-logger")
+
+# written in the dataset folder by every export (TagLab.saveDatasetClasses)
+CLASSES_FILE = "classes.json"
+
+
+def datasetLabels(dataset_folder):
+    """
+    The classes of an exported dataset, from its classes.json: {name: Label} with the colour of each class in the
+    label images, so that training doesn't depend on the labels of the open project. None if the dataset has no
+    readable classes.json (datasets exported before it existed).
+    """
+    filename = os.path.join(dataset_folder, CLASSES_FILE)
+    if not os.path.isfile(filename):
+        return None
+
+    try:
+        with open(filename, "r") as f:
+            data = json.load(f)
+        labels = {}
+        for item in data["classes"]:
+            name = item["name"]
+            color = item.get("color")
+            if name == "Background" or color is None:
+                continue
+            fill = [int(c) for c in color]
+            if len(fill) != 3:
+                raise ValueError("the colour of '" + name + "' is not [r, g, b]")
+            labels[name] = Label(id=name, name=name, fill=fill)
+        return labels
+    except Exception as e:
+        logfile.warning("[TRAINING] Can't read {:s} ({:s}): the labels of the open project are used.".format(
+            filename, str(e)))
+        return None
 
 
 def count_png_files(folder_path):

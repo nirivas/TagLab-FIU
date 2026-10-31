@@ -101,7 +101,7 @@ from source.QtProjectEditor import QtProjectEditor
 from source.Project import Project, loadProject, writeTextSafely
 from source.Point import Point
 from source.Image import Image
-from source.MapClassifier import MapClassifier
+from source.MapClassifier import MapClassifier, classifierLabels
 from source.NewDataset import NewDataset, mergedTargetClasses, exportLabels, mergeErrors, mergeSummary, BACKGROUND
 from source.QtClassMergeWidget import QtClassMergeWidget
 from source.QtGridWidget import QtGridWidget
@@ -6145,7 +6145,7 @@ class TagLab(QMainWindow):
             fl.write(str(target_pixel_size))
             fl.close()
 
-            self.saveDatasetClasses(basename, class_counts, class_map, export_labels)
+            added, exported_classes = self.saveDatasetClasses(basename, class_counts, class_map, export_labels)
 
             self.deleteProgressBar()
             self.deleteNewDatasetWidget()
@@ -6154,11 +6154,21 @@ class TagLab(QMainWindow):
 
             QApplication.restoreOverrideCursor()
 
+            text = "Dataset exported to {:s}: {:d} classes (listed in its classes.json).".format(basename, exported_classes)
+            if len(added) > 0:
+                text += ("\n\nLabels added to the project: " + ", ".join(added) + ". Save the project to keep them "
+                         "(Train Your Network reads the classes from the dataset itself).")
+            msgBox = QMessageBox()
+            msgBox.setWindowTitle(self.TAGLAB_VERSION)
+            msgBox.setText(text)
+            msgBox.exec()
+
     def saveDatasetClasses(self, folder, class_counts, class_map, export_labels):
         """
-        After a dataset export: the new names of merged classes become labels of the project (Train Your Network and
-        the classifier look the classes up there), and classes.json in the dataset folder lists each exported class,
-        its colour and the classes it was made of.
+        After a dataset export: the new names of merged classes become labels of the project (they show the merged
+        classes on the maps), and classes.json in the dataset folder lists each exported class, its colour and the
+        classes it was made of (Train Your Network reads the classes from it). It returns the labels added and the
+        number of exported classes.
         """
         added = []
         for name in sorted(set(class_map.values())):
@@ -6186,6 +6196,8 @@ class TagLab(QMainWindow):
         logfile.info("[DATASET] Exported '{:s}' to {:s}: {:s}; labels added to the project: {:s}".format(
             self.activeviewer.image.name, folder, summary.replace("\u2192", "->"), ", ".join(added) if added else "none"))
 
+        return added, len(classes)
+
     @pyqtSlot()
     def trainNewNetwork(self):
 
@@ -6202,6 +6214,11 @@ class TagLab(QMainWindow):
 
         target_classes = self.trainYourNetworkWidget.getTargetClasses()
         num_classes = len(target_classes)
+
+        # the colours of the classes in the label images: the dataset's own classes (classes.json), else the labels
+        # of the open project
+        training_labels = self.trainYourNetworkWidget.trainingLabels()
+        self.training_labels = training_labels
 
         # GO TRAINING GO...
         nepochs = self.trainYourNetworkWidget.getEpochs()
@@ -6233,7 +6250,7 @@ class TagLab(QMainWindow):
         try:
             dataset_train_info, train_loss_values, val_loss_values = training.trainingNetwork(images_dir_train, labels_dir_train,
                                                                                               images_dir_val, labels_dir_val,
-                                                                                              self.project.labels, target_classes, num_classes,
+                                                                                              training_labels, target_classes, num_classes,
                                                                                               save_network_as=network_filename, classifier_name=classifier_name,
                                                                                               epochs=nepochs, epochs_stage1=nepochs_stage1, epochs_stage2=nepochs_stage2, batch_sz=batch_size, batch_mult=4, validation_frequency=2,
                                                                                               loss_to_use="FOCAL_TVERSKY", epochs_switch=0, epochs_transition=0,
@@ -6258,7 +6275,7 @@ class TagLab(QMainWindow):
             self.progress_bar.setMessage("Test network..")
             QApplication.processEvents()
 
-            metrics = training.testNetwork(images_dir_test, labels_dir_test, labels_dictionary=self.project.labels,
+            metrics = training.testNetwork(images_dir_test, labels_dir_test, labels_dictionary=training_labels,
                                            target_classes=dataset_train_info.dict_target, dataset_train=dataset_train_info,
                                            network_filename=network_filename, output_folder=output_folder,
                                            progress=self.progress_bar)
@@ -6295,6 +6312,11 @@ class TagLab(QMainWindow):
         new_classifier["Weights"] = self.network_name
         new_classifier["Num. Classes"] = self.dataset_train_info.num_classes
         new_classifier["Classes"] = self.dataset_train_info.dict_target
+        # the colours of its classes, so that it can be applied to a project that has no labels for them
+        labels = getattr(self, "training_labels", None) or self.project.labels
+        new_classifier["Colors"] = {name: [int(c) for c in labels[name].fill]
+                                    for name in self.dataset_train_info.dict_target
+                                    if name != "Background" and name in labels}
 
         # scale
         target_pixel_size_file = os.path.join(self.trainResultsWidget.dataset_folder, "target-pixel-size.txt")
@@ -7479,15 +7501,10 @@ class TagLab(QMainWindow):
             checkLevel = self.classifierWidget.chkAutolevel.isChecked()
             pred_thresh = self.classifierWidget.sliderScores.value() / 100.0
 
-            for class_name in classifier_selected['Classes']:
-                mylabel = self.project.labels.get(class_name)
-                if class_name != 'Background' and mylabel is None:
-                    msgBox = QMessageBox()
-                    msgBox.setWindowTitle(self.TAGLAB_VERSION)
-                    txt = 'The label ' + class_name + ' is missing. Please check your dictionary and try again.'
-                    msgBox.setText(txt)
-                    msgBox.exec()
-                    return
+            # classes of the classifier that are not labels of the project are shown with their training colours
+            labels = self.labelsForClassifier(classifier_selected, add=False)
+            if labels is None:
+                return
 
             mode = "quality" if self.classifierWidget.chkQuality.isChecked() else "fast"
 
@@ -7496,7 +7513,7 @@ class TagLab(QMainWindow):
             self.setupProgressBar()
             QApplication.processEvents()
 
-            self.classifier = MapClassifier(classifier_selected, self.project.labels)
+            self.classifier = MapClassifier(classifier_selected, labels)
 
             self.progress_bar.hidePerc()
             self.progress_bar.setMessage("Initialization..")
@@ -7607,6 +7624,41 @@ class TagLab(QMainWindow):
             else:
                 self.classifier_progress.setValue(int(value))
 
+    def labelsForClassifier(self, classifier, add):
+        """
+        The labels to apply a classifier with, or None to stop. Its classes that are not labels of the project get
+        the colours stored with the classifier: with add=True they are added to the project after a question (the
+        regions created get those classes), otherwise they are used without changing the project (preview).
+        """
+        labels, added, unknown = classifierLabels(classifier, self.project.labels)
+
+        if len(unknown) > 0:
+            msgBox = QMessageBox()
+            msgBox.setWindowTitle(self.TAGLAB_VERSION)
+            msgBox.setText('The label ' + unknown[0] + ' is missing. Please check your dictionary and try again.')
+            msgBox.exec()
+            return None
+
+        if not add or len(added) == 0:
+            return labels
+
+        parent = self.classifierWidget if self.classifierWidget is not None else self
+        reply = QMessageBox.question(parent, self.TAGLAB_VERSION,
+                                     "These classes of the classifier are not labels of this project: " +
+                                     ", ".join(added) + ".\n\nAdd them to the labels of the project and classify?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return None
+
+        for name in added:
+            self.project.labels[name] = labels[name]
+        if self.activeviewer is not None and self.activeviewer.image is not None:
+            self.labels_widget.active_image = None
+            self.labels_widget.setLabels(self.project, self.activeviewer.image)
+        logfile.info("[AUTOCLASS] Labels added to the project for the classifier '{:s}': {:s}".format(
+            classifier['Classifier Name'], ", ".join(added)))
+        return self.project.labels
+
     @pyqtSlot()
     def applyClassifier(self):
         """
@@ -7621,15 +7673,9 @@ class TagLab(QMainWindow):
             pred_thresh = self.classifierWidget.sliderScores.value() / 100.0
             mode = "quality" if self.classifierWidget.chkQuality.isChecked() else "fast"
 
-            for class_name in classifier_selected['Classes']:
-                mylabel = self.project.labels.get(class_name)
-                if class_name != 'Background' and mylabel is None:
-                    msgBox = QMessageBox()
-                    msgBox.setWindowTitle(self.TAGLAB_VERSION)
-                    txt = 'The label ' + class_name + ' is missing. Please check your dictionary and try again.'
-                    msgBox.setText(txt)
-                    msgBox.exec()
-                    return
+            # the regions created get the classes of the classifier: they must be labels of the project
+            if self.labelsForClassifier(classifier_selected, add=True) is None:
+                return
 
             # free GPU memory
             self.resetNetworks()

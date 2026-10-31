@@ -10,7 +10,7 @@ from source.Project import Project, loadProject
 import torch
 import argparse
 from source.Image import Image
-from source.MapClassifier import MapClassifier
+from source.MapClassifier import MapClassifier, classifierLabels
 
 class ProgressPrinter(object):
 
@@ -29,6 +29,16 @@ def applyClassifier(input_image, classifier_to_use, taglab_project, prediction_t
     # setup the desired classifier
 
     progress_printer = ProgressPrinter(input_image.name)
+
+    # the classes of the classifier that are not labels of the project are added with their training colours
+    labels, added, unknown = classifierLabels(classifier_to_use, taglab_project.labels)
+    if len(unknown) > 0:
+        print("The label " + unknown[0] + " is missing in the project: image '" + input_image.name + "' not classified.")
+        return
+    if len(added) > 0:
+        for name in added:
+            taglab_project.labels[name] = labels[name]
+        print("Labels added to the project: " + ", ".join(added))
 
     classifier = MapClassifier(classifier_to_use, taglab_project.labels)
     classifier.updateProgress.connect(progress_printer.updateProgress)

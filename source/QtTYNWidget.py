@@ -43,6 +43,9 @@ class QtTYNWidget(QWidget):
         self.target_classes = None
         self.freq_classes = None
 
+        # the classes of the dataset (its classes.json), None when it has none: the project's labels are used then
+        self.dataset_labels = None
+
         self.setStyleSheet("background-color: rgb(40,40,40); color: white")
 
         TEXT_SPACE = 240
@@ -178,6 +181,13 @@ class QtTYNWidget(QWidget):
         layoutH2.addWidget(self.editDatasetFolder)
         layoutH2.addWidget(self.btnChooseDatasetFolder)
 
+        # where the class names and colours come from
+        self.lblClassSource = QLabel("")
+        self.lblClassSource.setWordWrap(True)
+        layoutH2b = QHBoxLayout()
+        layoutH2b.addSpacing(TEXT_SPACE)
+        layoutH2b.addWidget(self.lblClassSource)
+
         self.layoutClasses = QHBoxLayout()
         self.layoutClasses.addWidget(self.lblTargetClasses)
         self.layoutClasses.addWidget(self.groupbox_classes)
@@ -224,6 +234,7 @@ class QtTYNWidget(QWidget):
         self.layoutInputs = QVBoxLayout()
         self.layoutInputs.addLayout(layoutH1)
         self.layoutInputs.addLayout(layoutH2)
+        self.layoutInputs.addLayout(layoutH2b)
         self.layoutInputs.addLayout(self.layoutClasses)
         self.layoutInputs.addLayout(self.layoutTraining)
         self.layoutInputs.addLayout(layoutOptimizer)
@@ -380,8 +391,8 @@ class QtTYNWidget(QWidget):
 
     def setProjectLabels(self, labels):
         """
-        It uses the labels of the open project. Loading a dictionary replaces them, so the classes of the dataset
-        already chosen are found again.
+        It uses the labels of the open project. Loading a dictionary replaces them, so the classes of a dataset
+        without classes.json are found again (a dataset with classes.json doesn't use them).
         """
 
         if labels is self.project_labels:
@@ -389,12 +400,20 @@ class QtTYNWidget(QWidget):
 
         self.project_labels = labels
         dataset_folder = self.editDatasetFolder.text()
-        if dataset_folder != "" and os.path.exists(dataset_folder):
+        if self.dataset_labels is None and dataset_folder != "" and os.path.exists(dataset_folder):
             self.refreshClasses()
+
+    def trainingLabels(self):
+        """
+        The labels (name -> colour) the label images are read with: the dataset's own classes (classes.json), else
+        the labels of the open project.
+        """
+
+        return self.dataset_labels if self.dataset_labels is not None else self.project_labels
 
     def noClassFound(self):
         """
-        True when the dataset has label tiles but none of their colours is a label of the open project.
+        True when the dataset has label tiles but none of their colours is one of the training labels.
         """
 
         return self.freq_classes is not None and len(self.freq_classes) < 2
@@ -403,10 +422,16 @@ class QtTYNWidget(QWidget):
 
         msgBox = QMessageBox()
         msgBox.setWindowTitle(self.TAGLAB_VERSION)
-        msgBox.setText("No class of the open project was found in this dataset: the colours of its label images "
-                       "don't match the labels of the project.\n\n"
-                       "Open the project the dataset was exported from, or load its dictionary in "
-                       "Project > Labels Dictionary Editor, then open Train Your Network again.")
+        if self.dataset_labels is not None:
+            msgBox.setText("None of the classes listed in the classes.json of this dataset was found in its label "
+                           "images.\n\nExport the dataset again.")
+        else:
+            msgBox.setText("No class of the open project was found in this dataset: the colours of its label images "
+                           "don't match the labels of the project.\n\n"
+                           "Open the project the dataset was exported from, or load its dictionary in "
+                           "Project > Labels Dictionary Editor, then open Train Your Network again.\n\n"
+                           "Datasets exported with the current version of TagLab carry their own classes "
+                           "(classes.json): export it again to train it with any project open.")
         msgBox.exec()
 
 
@@ -513,7 +538,7 @@ class QtTYNWidget(QWidget):
                 btnC = QPushButton("")
                 btnC.setFlat(True)
 
-                label = self.project_labels.get(key)
+                label = self.trainingLabels().get(key)
                 if label is not None:
                     color = label.fill
                 else:
@@ -604,6 +629,8 @@ class QtTYNWidget(QWidget):
         # the classes of the previous folder or labels no longer apply
         self.target_classes = None
         self.freq_classes = None
+        self.dataset_labels = None
+        self.lblClassSource.setText("")
 
         # check dataset
         dataset_folder = self.editDatasetFolder.text()
@@ -636,7 +663,13 @@ class QtTYNWidget(QWidget):
             msgBox.exec()
             return
 
-        target_classes, freq_classes = CoralsDataset.importClassesFromDataset(labels_folder, self.project_labels)
+        self.dataset_labels = training.datasetLabels(dataset_folder)
+        if self.dataset_labels is not None:
+            self.lblClassSource.setText("Classes: from the dataset (classes.json)")
+        else:
+            self.lblClassSource.setText("Classes: from the labels of the open project (the dataset has no classes.json)")
+
+        target_classes, freq_classes = CoralsDataset.importClassesFromDataset(labels_folder, self.trainingLabels())
 
         self.target_classes = target_classes
         self.freq_classes = freq_classes
