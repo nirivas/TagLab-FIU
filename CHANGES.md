@@ -432,6 +432,9 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
   glossary.
 - **`TagLab_FIU_Quick_Reference.pdf`:** a short reference for people who already annotate: the toolbar, one card per
   tool, checklists, every menu command, the default keys and the glossary.
+- **The repository's wiki** (github.com/nirivas/TagLab-FIU/wiki) has the same guide as web pages, plus the quick
+  reference, the appendices and the glossary. Its screenshots are in `docs\wiki\`. The wiki is made from the manual's
+  text: don't edit it on GitHub, the changes would be lost at the next update.
 - The screenshots use TagLab's official sample projects; the menus, keys and toolbar tables are read from TagLab
   itself.
 
