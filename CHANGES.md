@@ -90,6 +90,11 @@ under the same GPL-3 licence. It changes the following.
   - It runs all the requested epochs and always saves a network.
   - It handles small validation and test sets, and trains all the intended layers.
   - It no longer needs an internet download.
+  - The colour augmentation works as intended with the installed albumentations 2. Its "not valid" warnings
+    at the start of training are gone. One of them meant that the random black holes were 1–2 squares of
+    about 50–100 pixels instead of 8 holes of 8 × 8 pixels, which could cover a small sponge while its label
+    stayed.
+  - The validation step no longer prints lists of tile file names.
 - **Train Your Network window:**
   - Choosing the dataset folder a second time no longer crashes ("wrapped C/C++ object of type QLabel has been
     deleted").
@@ -419,6 +424,16 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
 - **The defaults are the usual keys, with no mouse buttons,** so nothing changes until you edit something. Restore
   defaults puts them back. The shortcuts are stored on each computer, not in the project, and the official TagLab
   ignores them.
+
+## Manuals (in `docs\`)
+- **`TagLab_FIU_Guide.pdf`:** the step-by-step guide for new lab members (about 60 pages): setting up a project,
+  every annotation tool with screenshots, points, exports, DEM metrics, year-to-year comparison (alignment,
+  carry-over, comparison table), training and using classifiers, CoralNet, shortcuts, troubleshooting, and a
+  glossary.
+- **`TagLab_FIU_Quick_Reference.pdf`:** a short reference for people who already annotate: the toolbar, one card per
+  tool, checklists, every menu command, the default keys and the glossary.
+- The screenshots use TagLab's official sample projects; the menus, keys and toolbar tables are read from TagLab
+  itself.
 
 ## Dictionaries
 - **`spongenursery.json`** (in the main folder, next to `FDEP.json`): the sponge nursery labels.

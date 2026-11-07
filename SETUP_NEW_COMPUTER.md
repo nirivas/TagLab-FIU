@@ -28,6 +28,7 @@ to download missing models.
 ## 4. Start TagLab
 Double-click **`opentaglab.bat`**. It works wherever the folder is, and it uses the `venv` environment automatically.
 To create a desktop shortcut, right-click it and choose Send to > Desktop.
+How to use TagLab: `docs\TagLab_FIU_Guide.pdf` (step-by-step guide) and `docs\TagLab_FIU_Quick_Reference.pdf`.
 
 ## About the Python environment (`venv` folder)
 - **What it is:** a private copy of Python, with the packages TagLab needs, inside the TagLab folder. Other Python

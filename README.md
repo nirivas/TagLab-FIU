@@ -8,6 +8,8 @@
 > **This is the only TagLab you need**: it is the official TagLab 2026.4.1 plus the lab's changes. Do not install the
 > official TagLab as well.
 > **To install it on a computer, follow [SETUP_NEW_COMPUTER.md](SETUP_NEW_COMPUTER.md)** (not the instructions below).
+> **How to use it:** the lab's guide [docs/TagLab_FIU_Guide.pdf](docs/TagLab_FIU_Guide.pdf) (new lab members) and
+> [docs/TagLab_FIU_Quick_Reference.pdf](docs/TagLab_FIU_Quick_Reference.pdf).
 > The AI models are not included in this repository; `install_windows.bat` / `download_models.bat` download them.
 > To update an installation, double-click `update.bat`: it updates from this repository (nirivas/TagLab-FIU),
 > not from the official TagLab.
