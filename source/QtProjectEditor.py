@@ -25,6 +25,7 @@ from PyQt5.QtGui import QFont
 import rasterio as rio
 import os, json, re
 from source.RegionAttributes import RegionAttributes
+from source import Georeference
 from copy import deepcopy
 
 class QtProjectEditor(QWidget):
@@ -156,7 +157,11 @@ class QtProjectEditor(QWidget):
             self.table.setItem(row, 3, pixel_size_item)
             
             # Georef
-            georef_item = QTableWidgetItem("Yes" if img.georef_filename else "No")
+            if Georeference.isSetInTagLab(img):
+                georef_text = "Yes (set in TagLab)"
+            else:
+                georef_text = "Yes" if Georeference.isGeoreferenced(img) else "No"
+            georef_item = QTableWidgetItem(georef_text)
             georef_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             self.table.setItem(row, 4, georef_item)
             
@@ -224,9 +229,18 @@ class QtProjectEditor(QWidget):
         details += f"<b>Pixel Size (mm):</b> {img.map_px_to_mm_factor}<br>"
         details += f"<b>RGB Channel:</b> {img.channels[0].filename if img.channels else 'None'}<br>"
         
-        if img.georef_filename:
-            georef_info = self.georefAvailable(img.georef_filename)
-            details += f"<b>Georeference Information:</b><br><pre>{georef_info}</pre>"
+        georef = Georeference.get(img)
+        if georef is not None:
+            georef_info = self.georefAvailable(georef)
+            if Georeference.isSetInTagLab(img):
+                entry = img.metadata[Georeference.KEY]
+                source = "set in TagLab ({}{})".format(entry.get("method", ""), ", " + entry["date"]
+                                                       if entry.get("date") else "")
+            else:
+                source = "from the image file"
+            desc = Georeference.describe(georef.crs, georef.transform, (img.width, img.height), img.pixelSize())
+            details += f"<b>Georeference Information:</b> {source}<br><pre>{Georeference.describeText(desc)}" \
+                       f"</pre><pre>{georef_info}</pre>"
         else:
             details += f"<b>Georeference Information:</b> None<br>"
         
@@ -265,12 +279,20 @@ class QtProjectEditor(QWidget):
 
 
     def georefAvailable(self, path):
+        """
+        The coordinate system of a georeference (Georeference.GeoRef) or of a georeferenced file, as pretty WKT.
+        """
 
-        if path == "":
+        if path is None or path == "":
             return "None"
         else:
-            img = rio.open(path)
-            geoinfo = img.crs
+            if hasattr(path, "crs"):
+                geoinfo = path.crs
+            else:
+                with rio.open(path) as img:
+                    geoinfo = img.crs
+            if geoinfo is None:
+                return "None"
 
             from osgeo import osr
             srs = osr.SpatialReference()

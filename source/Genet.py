@@ -123,16 +123,35 @@ class Genet:
             path += str(round(x, 1)) + " " + str(round(y, 1))
         return path
 
+    COLONY_COLUMNS = ['colony', 'genet', 'map', 'date', 'id', 'class', 'area_cm2', 'surf_area_cm2']
+
     def exportCSV(self, filename):
         """
         One line per region per map (long format, e.g. for R): colony, genet, map, date, id, class, area_cm2,
         surf_area_cm2 (empty if not computed). Only the regions inside the working area, if there is one.
         """
-        working_area = self.project.working_area
+        import csv
+
+        with open(filename, mode='w', newline='') as file:
+            writer = csv.writer(file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(self.COLONY_COLUMNS)
+            for row in self.colonyRows():
+                writer.writerow(row)
+
+    def colonyRows(self, images=None, use_working_area=True):
+        """
+        The rows of exportCSV (columns COLONY_COLUMNS), the regions of a colony together in the order of the maps.
+        surf_area_cm2 is "" when not computed. images limits the rows to these maps (default: all);
+        use_working_area=False gives the regions outside the working area too. Also used by the GeoPackage export
+        (GeoExport).
+        """
+        working_area = self.project.working_area if use_working_area else None
         colonies = self.colonyNames()
         lines = []
 
         for order, img in enumerate(self.project.images):
+            if images is not None and img not in images:
+                continue
             if working_area is None:
                 blobs = img.annotations.seg_blobs
             else:
@@ -155,14 +174,7 @@ class Genet:
             return (order_of.get(map_name, len(order_of)), int(first_id) if first_id.isdigit() else -1)
 
         lines.sort(key=lambda line: (colonyKey(line[0]), line[1], line[2][4]))
-
-        import csv
-
-        with open(filename, mode='w', newline='') as file:
-            writer = csv.writer(file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
-            writer.writerow(['colony', 'genet', 'map', 'date', 'id', 'class', 'area_cm2', 'surf_area_cm2'])
-            for line in lines:
-                writer.writerow(line[2])
+        return [line[2] for line in lines]
 
 
     def exportSVG(self, filename):

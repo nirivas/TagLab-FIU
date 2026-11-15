@@ -327,19 +327,27 @@ def _warpRaster(src_filename, dst_filename, M, out_w, out_h, is_dem, crs, transf
     return out_w, out_h
 
 
-def georeferenceOfCanvas(reference_filename, left, top):
+def georeferenceOfCanvas(reference, left, top):
     """
-    CRS and transform of the output canvas, given the georeferenced reference image and the borders added
-    on its left and top side. Returns (None, None) if the reference is not georeferenced.
+    CRS and transform of the output canvas, given the reference map (an Image: its georeference, TagLab's own or
+    its file's, see Georeference.get) or a georeferenced image file, and the borders added on its left and top side.
+    Returns (None, None) if the reference is not georeferenced.
     """
 
-    if reference_filename is None or reference_filename == "":
+    if reference is None or reference == "":
         return None, None
 
-    with rio.open(reference_filename) as ref:
-        if ref.crs is None:
-            return None, None
-        return ref.crs, ref.transform * Affine.translation(-left, -top)
+    if isinstance(reference, str):
+        with rio.open(reference) as ref:
+            if ref.crs is None:
+                return None, None
+            return ref.crs, ref.transform * Affine.translation(-left, -top)
+
+    from source import Georeference
+    g = Georeference.get(reference)
+    if g is None:
+        return None, None
+    return g.crs, g.transform * Affine.translation(-left, -top)
 
 
 def uniqueSuffix(project, image, base, taglab_dir):
@@ -389,8 +397,11 @@ def createTransformedImage(image, suffix, M, width, height, crs, transform, px_s
 
     from source.Image import Image
 
-    # the plot values (DEM metrics) refer to an area of the original map
-    metadata = {key: value for key, value in (image.metadata or {}).items() if key != PLOT_METRICS_KEY}
+    # the plot values (DEM metrics) refer to an area of the original map; the georeference of the copy is in its
+    # files (crs, transform), and its pixel grid is recorded by the caller (the Alignment Tool)
+    from source import Georeference
+    dropped = (PLOT_METRICS_KEY, Georeference.KEY, Georeference.GRID_KEY)
+    metadata = {key: value for key, value in (image.metadata or {}).items() if key not in dropped}
 
     new_image = Image(rect=[0.0, 0.0, 0.0, 0.0], map_px_to_mm_factor=str(px_size), width=None, height=None,
                       channels=[], id=image.id + suffix, name=image.name + suffix,

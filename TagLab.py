@@ -67,6 +67,7 @@ import source.RasterOps as rasterops
 from source import DemMetrics
 from source import PointsFromRegions
 from source import CarryOver
+from source import Georeference
 from source.QtCarryOverWidget import QtCarryOverWidget
 from source.QtCarryOverReview import QtCarryOverReview
 from source.QtImageViewerPlus import QtImageViewerPlus
@@ -89,6 +90,9 @@ from source.QtNewDatasetWidget import QtNewDatasetWidget
 from source.QtSampleWidget import QtSampleWidget
 from source.QtPointsFromRegionsWidget import QtPointsFromRegionsWidget
 from source.QtGeoreferencingWidget import QtGeoreferencingWidget
+from source.QtSetGeoreferenceWidget import QtSetGeoreferenceWidget
+from source.QtGeoPackageExportWidget import QtGeoPackageExportWidget
+from source import GeoExport
 from source.QtTrainingResultsWidget import QtTrainingResultsWidget
 from source.QtTYNWidget import QtTYNWidget
 from source.QtDatasetManagerWidget import QtDatasetManagerWidget
@@ -276,6 +280,7 @@ class TagLab(QMainWindow):
         self.sample_point_widget = None
         self.points_from_regions_widget = None
         self.georeferencing_tool_widget = None
+        self.georeference_widget = None
         self.scale_widget = None
         self.dictionary_widget = None
         self.working_area_widget = None
@@ -1255,8 +1260,11 @@ class TagLab(QMainWindow):
         createDicAct = QAction("Labels Dictionary Editor...", self)
         createDicAct.triggered.connect(self.createDictionary)
 
-        georeferencingToolAct = QAction("Georeferencing Tool", self)
-        georeferencingToolAct.triggered.connect(self.openGeoreferencingTool)
+        # replaces the upstream Georeferencing Tool (openGeoreferencingTool, kept but no longer in the menu)
+        georeferencingToolAct = QAction("Georeference Map...", self)
+        georeferencingToolAct.setStatusTip("Georeference the map from a file georeferenced in ArcGIS Pro or from "
+                                           "coordinates, and share it with the maps aligned to it")
+        georeferencingToolAct.triggered.connect(self.openGeoreferenceMap)
 
         alignToolAct = QAction("Alignment Tool", self)
         alignToolAct.triggered.connect(self.openAlignmentTool)
@@ -1302,6 +1310,11 @@ class TagLab(QMainWindow):
         # exportShapefilesAct.setShortcut('Ctrl+??')
         exportShapefilesAct.setStatusTip("Export visible regions as shapefile")
         exportShapefilesAct.triggered.connect(self.exportAnnAsShapefiles)
+
+        exportGeoPackageAct = QAction("Export Regions As GeoPackage (ArcGIS)...", self)
+        exportGeoPackageAct.setStatusTip("Export the regions, points and comparison tables of the georeferenced "
+                                         "maps as a GeoPackage for ArcGIS Pro or QGIS")
+        exportGeoPackageAct.triggered.connect(self.exportGeoPackage)
 
         exportDXFfilesAct = QAction("Export Regions As DXF", self)
         exportDXFfilesAct.setStatusTip("Export visible regions as DXF")
@@ -1406,6 +1419,7 @@ class TagLab(QMainWindow):
         self.submenuExport.addAction(exportDataTableAct)
         self.submenuExport.addAction(exportMapAct)
         self.submenuExport.addAction(exportShapefilesAct)
+        self.submenuExport.addAction(exportGeoPackageAct)
         self.submenuExport.addAction(exportDXFfilesAct)
         self.submenuExport.addAction(exportSVGfilesAct)
         self.submenuExport.addAction(exportGeoRefLabelMapAct)
@@ -1864,12 +1878,12 @@ class TagLab(QMainWindow):
         if self.activeviewer is not None:
             if self.activeviewer.image is not None:
                 image = self.activeviewer.image
-                if image.georef_filename == "":
+                if not Georeference.isGeoreferenced(image):
                     # Georeferencing information are not available.
                     QMessageBox.warning(self,
                                         "Warning",
                                         f"Georeferencing information are not available for this map, and they are necessary to upload data in Reef Archive Lab.\n"
-                                        f"Use the Georefering Tool to georeference the current map.")
+                                        f"Use Project > Georeference Map to georeference the current map.")
                 else:
                     # export data
                     pass
@@ -3103,6 +3117,7 @@ class TagLab(QMainWindow):
 
         self.closeCarryOverReview()
         self.carryover_reasons = {}
+        self.closeGeoreferenceMap()
 
         self.viewerplus.clear()
         self.viewerplus2.clear()
@@ -4317,6 +4332,41 @@ class TagLab(QMainWindow):
             self.activeviewer.tools.tools["SELECTPOINTS"].setNumberOfPointsToSelect(number_of_points)
 
     @pyqtSlot()
+    def openGeoreferenceMap(self):
+        """
+        Project > Georeference Map (source/QtSetGeoreferenceWidget.py).
+        """
+        if len(self.project.images) == 0:
+            box = QMessageBox()
+            box.setText("Add a map to the project first (Project > Add New Map).")
+            box.exec()
+            return
+        if self.georeference_widget is not None:
+            self.georeference_widget.raise_()
+            self.georeference_widget.activateWindow()
+            return
+        image = self.activeviewer.image if self.activeviewer is not None else None
+        self.georeference_widget = QtSetGeoreferenceWidget(self.project, self, image, parent=self)
+        self.georeference_widget.applied.connect(self.georeferenceApplied)
+        self.georeference_widget.closed.connect(self.georeferenceMapClosed)
+        self.georeference_widget.show()
+
+    @pyqtSlot(list)
+    def georeferenceApplied(self, images):
+        if self.projectEditor is not None and self.projectEditor.isVisible():
+            self.projectEditor.fillMaps()
+
+    @pyqtSlot()
+    def georeferenceMapClosed(self):
+        self.georeference_widget = None
+
+    def closeGeoreferenceMap(self):
+        if self.georeference_widget is not None:
+            widget = self.georeference_widget
+            self.georeference_widget = None
+            widget.close()
+
+    @pyqtSlot()
     def closeGeoreferencingTool(self):
         self.georeferencing_tool_widget.close()
         self.georeferencing_tool_widget = None
@@ -5503,9 +5553,10 @@ class TagLab(QMainWindow):
             return
 
         if self.activeviewer.image is not None:
-            if self.activeviewer.image.georef_filename == "":
+            if not Georeference.isGeoreferenced(self.activeviewer.image):
                 box = QMessageBox()
-                box.setText("Georeferencing is not available; please load a georeferenced ortho image.")
+                box.setText("This map is not georeferenced. Load a georeferenced ortho image, or georeference the "
+                            "map with Project > Georeference Map.")
                 box.exec()
                 return
         else:
@@ -5533,7 +5584,7 @@ class TagLab(QMainWindow):
     @pyqtSlot(str,list,list)
     def readShapes(self, shapetype, attributelist, classes_list):
 
-        gf = self.activeviewer.image.georef_filename
+        gf = Georeference.get(self.activeviewer.image)
 
         if shapetype == 'Labeled regions':
 
@@ -5780,9 +5831,9 @@ class TagLab(QMainWindow):
             return
 
         if self.activeviewer.image is not None:
-            if self.activeviewer.image.georef_filename == "":
+            if not Georeference.isGeoreferenced(self.activeviewer.image):
                 box = QMessageBox()
-                box.setText("Georeferencing is not available.")
+                box.setText("This map is not georeferenced. Georeference it with Project > Georeference Map.")
                 box.exec()
                 return
 
@@ -5791,7 +5842,7 @@ class TagLab(QMainWindow):
 
         if output_filename:
             blobs = self.activeviewer.annotations.seg_blobs
-            gf = self.activeviewer.image.georef_filename
+            gf = Georeference.get(self.activeviewer.image)
             rasterops.write_shapefile(self.project, self.activeviewer.image, blobs, gf, output_filename)
 
             msgBox = QMessageBox(self)
@@ -5799,6 +5850,56 @@ class TagLab(QMainWindow):
             msgBox.setText("Shapefile exported successfully!")
             msgBox.exec()
             return
+
+    @pyqtSlot()
+    def exportGeoPackage(self):
+        """
+        File > Export > Export Regions As GeoPackage (ArcGIS): source/GeoExport.py, in the background.
+        """
+        if len(self.project.images) == 0:
+            box = QMessageBox()
+            box.setText("Add a map to the project first (Project > Add New Map).")
+            box.exec()
+            return
+        if not any(Georeference.isGeoreferenced(image) for image in self.project.images):
+            box = QMessageBox()
+            box.setText("No map of the project is georeferenced. Georeference one with Project > Georeference "
+                        "Map (from a file georeferenced in ArcGIS Pro, or from coordinates), then export again.")
+            box.exec()
+            return
+
+        active = self.activeviewer.image if self.activeviewer is not None else None
+        dialog = QtGeoPackageExportWidget(self.project, self.taglab_dir, active, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        images, filename, options = dialog.selectedImages(), dialog.filename(), dialog.options()
+
+        def job(progress, stop):
+            return GeoExport.exportGeoPackage(self.project, images, filename, options,
+                                              progress=lambda p, text="": progress(p), stop=stop)
+
+        try:
+            report, stopped = self.runInBackground("Exporting to GeoPackage..", job)
+        except GeoExport.GeoExportError as e:
+            box = QMessageBox(self)
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText(str(e))
+            box.exec()
+            return
+
+        if stopped or report is None:
+            box = QMessageBox(self)
+            box.setWindowTitle(self.TAGLAB_VERSION)
+            box.setText("Export stopped: the GeoPackage was not written.")
+            box.exec()
+            return
+
+        logfile.info("[GEOPACKAGE] {}: {}".format(report["file"], ", ".join(
+            "{} {}".format(layer["name"], layer["count"]) for layer in report["layers"])))
+        box = QMessageBox(self)
+        box.setWindowTitle(self.TAGLAB_VERSION)
+        box.setText(GeoExport.reportText(report))
+        box.exec()
 
     @pyqtSlot()
     def exportAnnAsDXF(self):
@@ -5837,9 +5938,9 @@ class TagLab(QMainWindow):
             box.exec()
             return
 
-        if self.activeviewer.image.georef_filename == "":
+        if not Georeference.isGeoreferenced(self.activeviewer.image):
             box = QMessageBox()
-            box.setText("Georeference information are not available.")
+            box.setText("This map is not georeferenced. Georeference it with Project > Georeference Map.")
             box.exec()
             return
 
@@ -5853,7 +5954,7 @@ class TagLab(QMainWindow):
             size = QSize(self.activeviewer.image.width, self.activeviewer.image.height)
             label_map_img = self.activeviewer.annotations.create_label_map(size, self.project.labels, None)
             label_map_np = genutils.qimageToNumpyArray(label_map_img)
-            georef_filename = self.activeviewer.image.georef_filename
+            georef_filename = Georeference.get(self.activeviewer.image)
             outfilename = os.path.splitext(output_filename)[0]
             rasterops.saveGeorefLabelMap(label_map_np, georef_filename, self.project.working_area, outfilename)
 
@@ -5876,9 +5977,9 @@ class TagLab(QMainWindow):
             box.exec()
             return
 
-        if self.activeviewer.image.georef_filename == "":
+        if not Georeference.isGeoreferenced(self.activeviewer.image):
             box = QMessageBox()
-            box.setText("Georeference information are not available.")
+            box.setText("This map is not georeferenced. Georeference it with Project > Georeference Map.")
             box.exec()
             return
 
@@ -5889,7 +5990,7 @@ class TagLab(QMainWindow):
             QApplication.setOverrideCursor(Qt.WaitCursor)
 
             myimage_np = genutils.qimageToNumpyArray(self.activeviewer.image.getRGBChannel().qimage)
-            georef_filename = self.activeviewer.image.georef_filename
+            georef_filename = Georeference.get(self.activeviewer.image)
             outfilename = os.path.splitext(output_filename)[0]
             rasterops.saveGeorefLabelMap(myimage_np, georef_filename, self.project.working_area, outfilename)
 
@@ -6394,7 +6495,8 @@ class TagLab(QMainWindow):
             else:
                 blobs = self.activeviewer.annotations.calculate_inner_blobs(self.project.working_area)
 
-            gf = self.activeviewer.image.georef_filename
+            # the map's georeference (TagLab's or the files'); without one, the DEM file's own grid
+            gf = Georeference.get(self.activeviewer.image) or input_tiff
             rasterops.saveClippedTiff(input_tiff, blobs, gf, output_filename)
 
             QApplication.restoreOverrideCursor()

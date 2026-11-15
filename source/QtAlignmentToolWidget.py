@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import QWidget, QHeaderView, QSizePolicy, QVBoxLayout, QLab
 
 from source.QtImageViewer import QtImageViewer
 from source import Alignment as AL
+from source import Georeference as GR
 from source.DemMetrics import DemReader
 
 logfile = logging.getLogger("tool-logger")
@@ -2183,8 +2184,10 @@ class QtAlignmentToolWidget(QWidget):
                 txt += " Not carried over to the extended reference: " + ", ".join(lost1) + "."
             if len(others) > 0:
                 txt += "\n  The other maps of the project ({}) are not shifted: if they were aligned to '{}', " \
-                       "they will be offset by the same amount and must be aligned again.".format(
-                            ", ".join("'" + name + "'" for name in others), image1.name)
+                       "they will be offset by the same amount and must be aligned again to start at the same " \
+                       "corner. TagLab records the offset, so a georeference set later (Project > Georeference " \
+                       "Map) still applies to them.".format(", ".join("'" + name + "'" for name in others),
+                                                            image1.name)
             txt += "\n\n- Crop to the reference: the aligned map is cut at the left/top edge of the reference, " \
                    "nothing else changes."
         else:
@@ -2201,7 +2204,7 @@ class QtAlignmentToolWidget(QWidget):
         left, top = canvas['left'], canvas['top']
 
         M = AL.pixelMatrix(self.matrix, self.pxSizeL, self.pxSizeR, (left, top))
-        crs, geoTransform = AL.georeferenceOfCanvas(image1.georef_filename, left, top)
+        crs, geoTransform = AL.georeferenceOfCanvas(image1, left, top)
 
         nimages = 2 if extend else 1
         progress = QProgressDialog("Aligning..", None, 0, 100, self)
@@ -2242,6 +2245,13 @@ class QtAlignmentToolWidget(QWidget):
             return
         QApplication.restoreOverrideCursor()
         progress.close()
+
+        # the aligned map is on the pixel grid of the reference (shifted by the extension, if any): recorded, so that
+        # a georeference set later on one of them applies to the others (Georeference.coRegistered)
+        group, origin = GR.ensureGrid(image1)
+        origin = (origin[0] - left, origin[1] - top)
+        for (old, new, _) in replacements:
+            GR.setGrid(new, group, origin)
 
         # the markers are stored for the original maps: TagLab moves them into the frames of the copies
         self.__storeMarkers()

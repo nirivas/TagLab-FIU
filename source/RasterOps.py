@@ -12,7 +12,7 @@ import rasterio as rio
 from rasterio.plot import reshape_as_raster
 from rasterio.mask import mask
 from rasterio.control import GroundControlPoint
-from rasterio.transform import from_origin, from_gcps
+from rasterio.transform import from_origin, from_gcps, Affine
 import pandas as pd
 from source.Blob import Blob
 from source import DemMetrics
@@ -114,9 +114,21 @@ def georeferencingImage(img, pixel_size, anchor_x, anchor_y, anchor_lat, anchor_
         dst.write(img)
 
 
+def georefOf(georef):
+    """
+    (crs, transform) of a georeference: a Georeference.GeoRef (TagLab's georeference of a map, see
+    Georeference.get) or the name of a georeferenced image file.
+    """
+    if hasattr(georef, "transform") and hasattr(georef, "crs"):
+        return georef.crs, georef.transform
+    with rio.open(georef) as img:
+        return img.crs, img.transform
+
+
 def changeFormat(contour, transform):
     """
-    convert blob coordinates for Polygon shapefiles. Coord are in pixels while pointsgeo are in mm
+    TagLab pixel coordinates (pixel centres at integers) -> world coordinates. The rasterio transform maps the
+    corner of the pixel (0, 0): the centre of the pixel (x, y) is at transform * (x + 0.5, y + 0.5).
     """
     coords = []
     pointsgeo = []
@@ -128,7 +140,7 @@ def changeFormat(contour, transform):
         for points in coords:
             x = points[0]
             y = points[1]
-            pointgeo = transform * (x, y)
+            pointgeo = transform * (x + 0.5, y + 0.5)
             pointsgeo.append(pointgeo)
         return pointsgeo
     else:
@@ -148,7 +160,7 @@ def changeFormatInv(coord, transform):
             xref = points[0]
             yref = points[1]
             pointpix = ~transform * (xref, yref)
-            pointpixels.append(pointpix)
+            pointpixels.append((pointpix[0] - 0.5, pointpix[1] - 0.5))
         return pointpixels
 
 def changeFormatInvPoint(coord, transform):
@@ -159,7 +171,7 @@ def changeFormatInvPoint(coord, transform):
         xref = coord[0]
         yref = coord[1]
         pointpix = ~transform * (xref, yref)
-        return pointpix
+        return pointpix[0] - 0.5, pointpix[1] - 0.5
 
 
 def createPolygon(blob, transform):
@@ -182,8 +194,8 @@ def createPolygonFromWorkingArea(working_area, transform):
 
     wa_coord = [(working_area[1], working_area[0]), (working_area[1] + working_area[2], working_area[0]), (working_area[1] + working_area[2] , working_area[0] + working_area[3]),(working_area[1], working_area[0]+ working_area[3])]
 
-    # load blob.contour and transform coordinate
-    wa_coord_change = changeFormat(wa_coord, transform)
+    # the working area covers whole pixels: its corners are pixel corners (no half-pixel shift, unlike the contours)
+    wa_coord_change = [transform * c for c in wa_coord]
     waPolygon = Polygon(wa_coord_change)
 
     return waPolygon
@@ -205,10 +217,12 @@ def read_attributes(filename):
     return data
 
 
-def read_regions_geometry(filename, georef_filename):
+def read_regions_geometry(filename, georef):
+    """
+    georef: TagLab's georeference of the map (Georeference.get) or a georeferenced image file.
+    """
 
-    img = rio.open(georef_filename)
-    transform = img.transform
+    crs, transform = georefOf(georef)
 
     driver = ogr.GetDriverByName("ESRI Shapefile")
     dataSource = driver.Open(filename, 0)
@@ -217,14 +231,19 @@ def read_regions_geometry(filename, georef_filename):
 
     #set spatial reference and transformation
     sourceprj = layer.GetSpatialRef()
-    targetprj = osr.SpatialReference(wkt = img.crs.wkt)
-    #need to check if sourceproj == targetproj
-    reproject = osr.CoordinateTransformation(sourceprj, targetprj) #this is a transform
+    reproject = None
+    if sourceprj is not None and crs is not None:
+        targetprj = osr.SpatialReference(wkt=crs.wkt)
+        targetprj.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        sourceprj.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        if not sourceprj.IsSame(targetprj):
+            reproject = osr.CoordinateTransformation(sourceprj, targetprj)
 
     blobList = []
     for feat in layer:
         transformed = feat.GetGeometryRef()
-        transformed.Transform(reproject)
+        if reproject is not None:
+            transformed.Transform(reproject)
 
         shpdict = json.loads(feat.ExportToJson())
         if shpdict['geometry']['type'] == 'Polygon':
@@ -249,10 +268,9 @@ def read_regions_geometry(filename, georef_filename):
     return blobList
 
 
-def read_geometry(filename, georef_filename):
+def read_geometry(filename, georef):
 
-    img = rio.open(georef_filename)
-    transform = img.transform
+    crs, transform = georefOf(georef)
 
     driver = ogr.GetDriverByName("ESRI Shapefile")
     dataSource = driver.Open(filename, 0)
@@ -287,16 +305,15 @@ def read_geometry(filename, georef_filename):
 
 
 
-def write_shapefile( project, image, blobs, georef_filename, out_shp):
+def write_shapefile( project, image, blobs, georef, out_shp):
     """
     https://gis.stackexchange.com/a/52708/8104
+    georef: TagLab's georeference of the map (Georeference.get) or a georeferenced image file.
     """
     scale_factor = image.pixelSize()
     date = image.acquisition_date
     # load georeference information to use
-    img = rio.open(georef_filename)
-    geoinfo = img.crs
-    transform = img.transform
+    geoinfo, transform = georefOf(georef)
     annotations = image.annotations
 
     working_area = project.working_area
@@ -453,67 +470,63 @@ def load_georef(image):
     transform = img.transform
     return geoinfo, transform
 
-def saveClippedTiff(input, blobs, georef_filename, name):
+def saveClippedTiff(input, blobs, georef, name):
+    """
+    Clip the raster input (a channel of the map, so on the map's pixel grid) to the regions. The regions are cut in
+    the pixel grid of the file itself; the output gets the georeference of the map (georef: Georeference.get or a
+    georeferenced image file), which may be TagLab's own and not the file's.
+    """
 
-    # load georeference information to use
-    img = rio.open(georef_filename)
-    geoinfo = img.crs
-    transform = img.transform
+    geoinfo, transform = georefOf(georef)
+
+    dataset = rio.open(input)
+    own = dataset.transform
 
     # convert blobs into polygons
     mypolygons = []
     for blob in blobs:
         if blob.qpath_gitem.isVisible():
-            polygon = createPolygon(blob, transform)
+            polygon = createPolygon(blob, own)
             mypolygons.append(polygon)
 
-    dataset = rio.open(input)
     out_image, out_transform = rio.mask.mask(dataset, mypolygons, crop=True)
-    # num_non_null = (out_image != 500000).sum()
+    # where the crop starts, in pixels of the map
+    col0, row0 = ~own * (out_transform.c, out_transform.f)
+    col0, row0 = int(round(col0)), int(round(row0))
     out_meta = dataset.meta
-    # area= out_meta['transform'][0] ** 2*out_image
     out_meta.update({"driver": "GTiff",
                       "height": out_image.shape[1],
                       "width": out_image.shape[2],
-                      "transform": out_transform})
+                      "crs": geoinfo,
+                      "transform": transform * Affine.translation(col0, row0)})
+    dataset.close()
 
     with rio.open(name, "w", **out_meta) as dest:
         dest.write(out_image)
 
-def saveGeorefLabelMap(label_map, georef_filename, working_area, out_name):
+def saveGeorefLabelMap(label_map, georef, working_area, out_name):
+    """
+    Save an RGB image of the map (label map or the map itself, height x width x 3) as a GeoTIFF with the
+    georeference of the map (georef: Georeference.get or a georeferenced image file).
+    """
 
-    ## TO DO: CLEAN UP THIS FUNCTION!
-
-    # create a georeferenced label image (as raster)
-    img = rio.open(georef_filename)
-    meta = img.meta
-    transform = img.transform
-    crs = img.crs
+    crs, transform = georefOf(georef)
 
     myLabel = reshape_as_raster(label_map)
-    myLabel_meta = meta.copy()
-    myLabel_meta.update({"dtype": rio.uint8,
-                         "count": 3,
-                         "nodata": None})
-    with rio.open(out_name + ".tif", "w", **myLabel_meta) as dest:
-        dest.write(myLabel)
 
     if working_area is not None:
+        # the working area [top, left, width, height] is a rectangle of pixels: cut it directly (a polygon in world
+        # coordinates would give a larger, masked crop when the georeference is rotated)
+        top, left, width, height = [int(round(v)) for v in working_area]
+        top, left = max(top, 0), max(left, 0)
+        myLabel = myLabel[:, top:top + height, left:left + width]
+        transform = transform * Affine.translation(left, top)
 
-        dataset = rio.open(out_name + ".tif")
-        # convert the working area into a polygon
-        working_area_polygon = createPolygonFromWorkingArea(working_area, transform)
-        # crop the raster using the working area polygon
-        out_image, out_transform = rio.mask.mask(dataset, [working_area_polygon], crop=True)
-        out_meta = dataset.meta.copy()
-        out_meta.update({"driver": "GTiff",
-                          "height": out_image.shape[1],
-                          "width": out_image.shape[2],
-                          "transform": out_transform})
-        dataset.close()
-
-        with rio.open(out_name + ".tif", "w", **out_meta) as dest:
-            dest.write(out_image)
+    myLabel_meta = {"driver": "GTiff", "width": myLabel.shape[2], "height": myLabel.shape[1],
+                    "dtype": rio.uint8, "count": 3, "nodata": None, "crs": crs, "transform": transform,
+                    "compress": "deflate"}
+    with rio.open(out_name + ".tif", "w", **myLabel_meta) as dest:
+        dest.write(myLabel)
 
 
 def exportSlope(raster, filename):

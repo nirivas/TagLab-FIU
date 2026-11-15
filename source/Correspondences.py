@@ -584,12 +584,23 @@ class Correspondences(object):
         # reindexing
         self.data.reset_index(drop=True, inplace=True)
 
+    TIDY_COLUMNS = ['colony', 'genet', 'map1', 'date1', 'id1', 'class1', 'area1_cm2', 'surf_area1_cm2',
+                    'map2', 'date2', 'id2', 'class2', 'area2_cm2', 'surf_area2_cm2',
+                    'fate', 'split_fuse', 'change_cm2', 'change_pct', 'years', 'to_check']
+
     def exportTidy(self, filename, colonies):
         """
         Save the table as a CSV file for R or a spreadsheet: one line per row, with both regions described (map,
         date, id, class, planar and surface area in cm^2), the fate, the area change and the time between the two
         maps. For a split or a fusion the change is the one of the whole group. colonies maps (image id, region id)
         to the stable colony name (see Genet.colonyNames). The values do not depend on the area shown in the panel.
+        """
+        self.tidyTable(colonies).to_csv(filename, index=False)
+
+    def tidyTable(self, colonies):
+        """
+        The rows of exportTidy as a DataFrame (columns TIDY_COLUMNS; missing values are None / NaN / pd.NA, to_check
+        is the text "TRUE" / "FALSE"). Also used by the GeoPackage export (GeoExport).
         """
         src, tgt = self.regionsById()
         px1 = self.source.pixelSize()
@@ -647,13 +658,10 @@ class Correspondences(object):
                           blob2.class_name if blob2 is not None else None, cm2(blob2, px2), cm2(blob2, px2, True),
                           row[6], row[7], change, change_pct, years, "TRUE" if to_check else "FALSE"])
 
-        columns = ['colony', 'genet', 'map1', 'date1', 'id1', 'class1', 'area1_cm2', 'surf_area1_cm2',
-                   'map2', 'date2', 'id2', 'class2', 'area2_cm2', 'surf_area2_cm2',
-                   'fate', 'split_fuse', 'change_cm2', 'change_pct', 'years', 'to_check']
-        table = pd.DataFrame(lines, columns=columns)
+        table = pd.DataFrame(lines, columns=self.TIDY_COLUMNS)
         table = table.astype({'id1': 'Int64', 'id2': 'Int64'})
         table.sort_values(by=['id1', 'id2'], inplace=True, na_position='last')
-        table.to_csv(filename, index=False)
+        return table
 
     def autoMatch(self, blobs1, blobs2):
         """

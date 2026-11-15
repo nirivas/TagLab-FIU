@@ -425,6 +425,47 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
   defaults puts them back. The shortcuts are stored on each computer, not in the project, and the official TagLab
   ignores them.
 
+## ArcGIS Pro and georeferencing
+- **Project > Georeference Map...** (replaces the official Georeferencing Tool, which didn't work) gives a map its
+  place in the world. TagLab stores it in the project; the image files are never changed.
+  - **From an ArcGIS file:** georeference the map's orthomosaic in ArcGIS Pro (Imagery > Georeference), then
+    - Save as New (recommended): choose the new raster. TagLab finds its map in it by matching the two images, so
+      the new raster may be rotated, resampled or have another pixel size. The match error is shown in mm.
+    - Save: choose the map's own image file. TagLab reads the georeference ArcGIS wrote next to it (.aux.xml,
+      world file).
+  - **From coordinates:** click points on the map and type their coordinates: latitude / longitude (decimal or
+    degrees-minutes-seconds such as 18°19'12.3"N), UTM zone 20N or 19N, Puerto Rico State Plane, or any EPSG code.
+    - By default TagLab only turns and moves the map, keeping its own pixel size. One point is enough when you type
+      the direction of the map's top edge; with more points the error of each point is shown. "Fit the scale too"
+      (2 points or more) and "Affine" (3 points or more) are options.
+    - Latitude / longitude is converted to a metric system (the UTM zone of the points by default).
+- **Maps aligned in TagLab share it.** A map aligned with the Alignment Tool is on the same pixel grid as its
+  reference, and TagLab now records that at Confirm. When one of them gets a georeference, the others get it too
+  (they are listed, ticked, under "Apply to").
+  - For maps aligned before this version, "Check the other maps" compares the images and offers those that line up
+    within 1 mm.
+- **File > Export > Export Regions As GeoPackage (ArcGIS)...:** one file that ArcGIS Pro and QGIS open directly:
+  - one layer of regions per map, with the class, area, surface area, perimeter, colony and genet, note, "match to
+    check" and every region attribute (DEM metrics, carry-over status, your own)
+  - the points of each map, the comparison tables and the colonies table
+  - "views" of each map's orthomosaic and DEM (small `.vrt` files that point to TagLab's images and give them the
+    georeference: nothing is copied)
+  - only the georeferenced maps; by default only the regions inside the working area
+- **ArcGIS Pro toolbox** (`arcgis\TagLab.pyt`; how to add it: `arcgis\README.txt`):
+  - **Import TagLab Project:** makes the GeoPackage, optionally copies it into a file geodatabase, and adds
+    everything to the current map, a group per map, with the regions in TagLab's class colours.
+  - **Georeference TagLab Maps:** the "From an ArcGIS file" step without opening TagLab. Close the project in TagLab
+    first. The project is saved; the previous version is kept next to it (`<project>.before_georef_<date>.json`).
+  - It needs TagLab installed on the same computer: it runs TagLab's own Python.
+- **Shapefiles:** exported outlines were half a pixel up and to the left of their place on the map, and Import
+  Shapefile put outlines drawn in a GIS half a pixel down and to the right. Both are fixed, and export + import
+  still gives back the same outlines. A shapefile exported by an older version now comes back half a pixel (well
+  under 1 mm on our maps) up and to the left.
+- The other georeferenced exports (label map, georeferenced image, clipped raster) and Import Shapefile also work
+  with a map georeferenced in TagLab.
+- TagLab's measurements (areas, perimeters, DEM metrics) still use the map's pixel size (mm/px); the georeference only
+  places the map.
+
 ## Manuals (in `docs\`)
 - **`TagLab_FIU_Guide.pdf`:** the step-by-step guide for new lab members (about 60 pages): setting up a project,
   every annotation tool with screenshots, points, exports, DEM metrics, year-to-year comparison (alignment,
@@ -432,6 +473,9 @@ Moves colonies that are in the wrong place, for example after Carry Regions Over
   glossary.
 - **`TagLab_FIU_Quick_Reference.pdf`:** a short reference for people who already annotate: the toolbar, one card per
   tool, checklists, every menu command, the default keys and the glossary.
+- **The repository's wiki** (github.com/nirivas/TagLab-FIU/wiki) has the same guide as web pages, plus the quick
+  reference, the appendices and the glossary. Its screenshots are in `docs\wiki\`. The wiki is made from the manual's
+  text: don't edit it on GitHub, the changes would be lost at the next update.
 - The screenshots use TagLab's official sample projects; the menus, keys and toolbar tables are read from TagLab
   itself.
 

@@ -23,6 +23,7 @@ from rasterio.transform import Affine
 from skimage import measure
 
 from source.Alignment import applyMatrix, composeMatrix, phaseShift
+from source import Georeference
 from source.Blob import Blob
 from source.DemMetrics import DemReader, DEM_METRIC_NAMES
 from source.genutils import cropQImage, qimageToNumpyArray
@@ -120,15 +121,23 @@ def scaleMatrix(px_src, px_dst):
     return np.array([[s, 0.0, t], [0.0, s, t]])
 
 
-def georefMatrix(src_filename, dst_filename):
+def georefMatrix(src_georef, dst_georef):
     """
     Source pixel -> target pixel through the georeferencing of the two maps, or None if they are not both
-    georeferenced in the same reference system.
+    georeferenced in the same reference system. Each georeference is a Georeference.GeoRef (TagLab's georeference
+    of the map, see Georeference.get) or the name of a georeferenced image file.
     """
+    def read(g):
+        if hasattr(g, "transform") and hasattr(g, "crs"):
+            return g.transform, g.crs
+        with rio.open(g) as f:
+            return f.transform, f.crs
+
+    if src_georef is None or dst_georef is None:
+        return None
     try:
-        with rio.open(src_filename) as src, rio.open(dst_filename) as dst:
-            ts, tt = src.transform, dst.transform
-            cs, ct = src.crs, dst.crs
+        ts, cs = read(src_georef)
+        tt, ct = read(dst_georef)
     except Exception:
         return None
 
@@ -200,9 +209,7 @@ def computePlacement(src_image, dst_image, src_qimage, dst_qimage):
         warning = "The two maps have different pixel sizes ({:.3f} and {:.3f} mm). Check them in the map " \
                   "settings: the regions are scaled accordingly.".format(px_src, px_dst)
 
-    M = None
-    if src_image.georef_filename and dst_image.georef_filename:
-        M = georefMatrix(src_image.georef_filename, dst_image.georef_filename)
+    M = georefMatrix(Georeference.get(src_image), Georeference.get(dst_image))
 
     if M is not None:
         dx, dy, response, red = estimateGlobalOffset(src_qimage, dst_qimage, M)
